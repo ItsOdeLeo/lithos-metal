@@ -23,6 +23,10 @@ class MetalBackend:
     def handler(self, kind, shared_handlers):
         return shared_handlers[kind]
 
+    def gemm_tile_shape(self, info, tm):
+        """Measured chip-specific TN/TK, or None to retain the shared defaults."""
+        return None
+
     def direct_attention_shape(self, ctx, heads, kv, d, t, lm_mode, qk_norm):
         """Additional shapes eligible for the explicit direct-cache attention route."""
         return False

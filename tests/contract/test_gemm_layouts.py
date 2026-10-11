@@ -15,14 +15,37 @@ def _info(fmt="nvfp4", n=256, k=4096):
     return pack_spec(random_spec(fmt, n, k, np.random.default_rng(0)), PackLayout(rows=16))[1]
 
 
-@pytest.mark.parametrize("backend,layout", [("m3_pro", "apple9"), ("m3_max_30c", "apple9"), ("m4_pro", "apple9"),
+@pytest.mark.parametrize("backend,layout", [("m2_max_30c", "apple9"), ("m3_pro", "apple9"), ("m3_max_30c", "apple9"), ("m4_pro", "apple9"),
                                             ("m5_pro", "apple10"), ("m5_max_40c", "apple10")])
-def test_the_backend_picks_the_layout(backend, layout):
+def test_the_backend_picks_the_layout(backend, layout, monkeypatch):
+    # Cross-compilation must follow the selected backend, even on a different host GPU.
+    monkeypatch.setattr(kernels, "_device_family", lambda: 10 if layout == "apple9" else 8)
     with using_backend(backend):
         assert kernels.coop_layout() == layout
         macros = kernels.gemm_macros(_info(), tm=16)
         assert (macros.get("COOP_A9") == "1") == (layout == "apple9")
         assert ("PERM_A9" in kernels.perm_out_macros(4096, 32, 256)) == (layout == "apple9")
+
+
+@pytest.mark.parametrize("family,layout", [(8, "apple9"), (9, "apple9"), (10, "apple10"), (None, "apple10")])
+def test_standalone_harness_picks_the_host_layout(monkeypatch, family, layout):
+    monkeypatch.setattr(kernels, "_device_family", lambda: family)
+    with using_backend("common"):
+        assert kernels.coop_layout() == layout
+
+
+@pytest.mark.parametrize("fmt,tk", [("bf16", 64), ("fp8_e4m3", 64), ("nvfp4", 128), ("int8", 128), ("int4_affine", 128)])
+@pytest.mark.parametrize("tm", [8, 16, 32])
+def test_m2_tiles_and_explicit_diagnostic_override(fmt, tk, tm):
+    info = _info(fmt, k=5120)
+    with using_backend("m2_max_30c"):
+        macros = kernels.gemm_macros(info, tm=tm)
+        assert (macros["TN"], macros["TK"]) == ("16u", f"{tk}u")
+        explicit = kernels.gemm_macros(info, tm=tm, tn=32, tk=128)
+        assert (explicit["TN"], explicit["TK"]) == ("32u", "128u")
+    # M2's measured override must not change other backends' defaults.
+    with using_backend("m4_pro"):
+        assert kernels.gemm_macros(info, tm=32)["TN"] == "32u"
 
 
 def _perm_dest(n, k, wpw, tk, layout):

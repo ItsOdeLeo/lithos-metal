@@ -5,8 +5,8 @@
   "gpu_family": "Apple8",
   "gpu_cores": 30,
   "nominal_gbps": 0,
-  "validation": "unmeasured",
-  "note": "Conservative native-shader configuration for the exact 30-core device. No latency, bandwidth, fusion or acceptance claims; tuning remains unmeasured.",
+  "validation": "measured",
+  "note": "Measured matrix tiles and GEMV crossover on the exact 30-core M2 Max. Direct serial command encoding remains the backend default; cross-worker mixer fusion remains disabled.",
   "engine": {
     "family": "Apple8",
     "lane_order": "interleaved16",
@@ -16,9 +16,173 @@
     "max_cb_ms": 16,
     "attention": "v1",
     "attention_rows": 4,
-    "accelerator": "off",
-    "accelerator_min_t": {},
-    "cost_T": {},
+    "accelerator": "on",
+    "accelerator_min_t": {
+      "nvfp4": 8,
+      "fp8": 4,
+      "int4_affine": 4,
+      "bf16": 8,
+      "int8": 4
+    },
+    "cost_T": {
+      "nvfp4": {
+        "1": 1.0,
+        "2": 2.993,
+        "4": 3.256,
+        "8": 7.748
+      },
+      "fp8": {
+        "1": 1.0,
+        "2": 1.234,
+        "4": 3.813,
+        "8": 4.547
+      },
+      "int4_affine": {
+        "1": 1.0,
+        "2": 2.963,
+        "4": 3.869,
+        "8": 7.278
+      },
+      "bf16": {
+        "1": 1.0,
+        "2": 0.973,
+        "4": 1.109,
+        "8": 5.242
+      },
+      "int8": {
+        "1": 1.0,
+        "2": 0.989,
+        "4": 3.899,
+        "8": 5.344
+      },
+      "accelerator_nvfp4": {
+        "8": 4.376,
+        "16": 6.308,
+        "32": 20.957
+      },
+      "accelerator_fp8": {
+        "8": 2.921,
+        "16": 4.005,
+        "32": 7.05
+      },
+      "accelerator_int4_affine": {
+        "8": 3.682,
+        "16": 5.204,
+        "32": 10.494
+      },
+      "accelerator_bf16": {
+        "8": 1.198,
+        "16": 1.865,
+        "32": 3.451
+      },
+      "accelerator_int8": {
+        "8": 2.604,
+        "16": 3.76,
+        "32": 8.026
+      }
+    },
     "gdn_mixer_fusion": {}
+  },
+  "measured": "2026-10-11",
+  "memory_gb": 64,
+  "os": "macOS 26.7",
+  "matrix_calibration": {
+    "shape": "17408x5120",
+    "copies": null,
+    "reps": 3,
+    "lane_order_measured_with": "interleaved16",
+    "scale_placement": "block",
+    "shader_ms": {
+      "nvfp4": {
+        "1": 0.226,
+        "2": 0.6765,
+        "4": 0.7359,
+        "8": 1.751
+      },
+      "fp8_e4m3": {
+        "1": 0.3535,
+        "2": 0.4361,
+        "4": 1.3479,
+        "8": 1.6074
+      },
+      "int4_affine": {
+        "1": 0.2615,
+        "2": 0.7747,
+        "4": 1.0117,
+        "8": 1.9033
+      },
+      "bf16": {
+        "1": 0.5894,
+        "2": 0.5735,
+        "4": 0.6537,
+        "8": 3.0896
+      },
+      "int8": {
+        "1": 0.3544,
+        "2": 0.3504,
+        "4": 1.3818,
+        "8": 1.8938
+      }
+    },
+    "shader_geometry": {
+      "nvfp4": {
+        "1": "block",
+        "2": "block",
+        "4": "block",
+        "8": "crew"
+      },
+      "fp8_e4m3": {
+        "1": "block",
+        "2": "block",
+        "4": "block",
+        "8": "block"
+      },
+      "int4_affine": {
+        "1": "block",
+        "2": "block",
+        "4": "block",
+        "8": "block"
+      },
+      "bf16": {
+        "1": "block",
+        "2": "block",
+        "4": "block",
+        "8": "block"
+      },
+      "int8": {
+        "1": "block",
+        "2": "block",
+        "4": "block",
+        "8": "crew"
+      }
+    },
+    "tile_ms": {
+      "nvfp4": {
+        "8": 0.9889,
+        "16": 1.4256,
+        "32": 4.7363
+      },
+      "fp8_e4m3": {
+        "8": 1.0327,
+        "16": 1.4156,
+        "32": 2.4923
+      },
+      "int4_affine": {
+        "8": 0.9629,
+        "16": 1.3609,
+        "32": 2.7443
+      },
+      "bf16": {
+        "8": 0.7062,
+        "16": 1.0995,
+        "32": 2.0343
+      },
+      "int8": {
+        "8": 0.923,
+        "16": 1.3326,
+        "32": 2.8444
+      }
+    },
+    "note": "Fixed interleaved16/block pack layout, min-of-3 over approximately 2 GiB per point. Lane order, threadgroups per core, attention and cross-worker fusion policies are retained."
   }
 }

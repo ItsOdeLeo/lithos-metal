@@ -54,7 +54,7 @@ class Harness:
         if prepared:
             macros["PREPARED"] = "1"
         if fused_norm:
-            assert prepared and slice_cols == 4 and slices_per_block == 1
+            assert prepared and slice_cols in (4, 8, 16) and slices_per_block == 1
             macros["FUSED_NORM"] = "1"
         if local_prepare:
             macros["LOCAL_PREPARE"] = "1"
@@ -137,7 +137,7 @@ class Harness:
         if self.local_prepare:
             d.grid(self.n_sg // self.local_groups).threadgroup(32 * self.local_groups)
         if self.fused_norm:
-            d.bytes(11, params).buffer(12, self.aux[3]).buffer(13, mb).buffer(14, out).grid(hv).threadgroup(32 * m.dv // 4)
+            d.bytes(11, params).buffer(12, self.aux[3]).buffer(13, mb).buffer(14, out).grid(hv).threadgroup(32 * self.local_groups)
             ds = [d]
         if self.prepared and not self.local_prepare:
             dp = (nt.Dispatch().pipeline(self.pso_prepare).buffer(0, mb).buffer(1, abb).buffer(2, self.conv_state)

@@ -49,14 +49,14 @@ NORM_OUT_MSL = PERM_OUT_MSL.replace("PERM_", "NORM_").replace("perm_dest", "norm
 
 
 def coop_layout() -> str:
-    """The cooperative-tensor register layout gemm_tile fills: ``"apple9"`` on the M3 / M4 GPUs (8 × 8 matrices),
+    """The cooperative-tensor register layout gemm_tile fills: ``"apple9"`` on M2 / M3 / M4 GPUs (8 × 8 matrices),
     ``"apple10"`` on the M5's neural accelerators. The backend being compiled for decides; outside a compilation (the
     kernel harnesses) the device's GPU family does, and without the Metal module the Apple10 layout is assumed."""
     from .backends.metal.registry import DEVICES
     device = DEVICES.get(current_backend().id)
     if device is not None:
-        return "apple9" if device[1] == "Apple9" else "apple10"
-    return "apple9" if _device_family() == 9 else "apple10"
+        return "apple9" if device[1] in ("Apple8", "Apple9") else "apple10"
+    return "apple9" if _device_family() in (8, 9) else "apple10"
 
 
 _FAMILY: List[Optional[int]] = []
@@ -298,8 +298,11 @@ def gemm_macros(info: PackInfo, *, tm: int, out_bf16: bool = False, tn: Optional
     wpw = int(f.weights_per_word)
     a9 = coop_layout() == "apple9"
     if tn is None or tk is None:
+        selected = current_backend().gemm_tile_shape(info, tm)
         # Small INT4 and BF16 projections benefit from fewer live operand registers (#113).
-        if info.format == "nvfp4" and info.k >= 4096 and tm == 8:
+        if selected is not None:
+            tn, tk = selected
+        elif info.format == "nvfp4" and info.k >= 4096 and tm == 8:
             tn, tk = 16, 128
             if scale_cache is None:
                 scale_cache = False

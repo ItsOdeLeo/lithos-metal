@@ -1,5 +1,13 @@
 # Kernel benches
 
+`matrix_profile.py --config <chip.json> --out <candidate.json>` measures the five
+matrix formats at the supplied pack layout and writes matrix crossover/costs
+without changing attention or cross-worker fusion policies. `matrix_ab.py`
+compares accelerator off/on with alternating warmed model runs, retaining every
+sample and checking greedy token equality. See the
+[M2 Max qualification](../../monolith/backends/metal/m2_max_30c/README.md) for
+the reference checkpoint, measured scope and reproduction commands.
+
 `modelopt_layer_bench.py` compares fixed eight-row NVIDIA ModelOpt decoder layers
 against native MLX-LM, including its original-code NVFP4 and FP8 matrix paths.
 `--fusion --config <geometry.json>` evaluates two static megakernels per layer;

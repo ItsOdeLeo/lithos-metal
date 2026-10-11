@@ -73,7 +73,7 @@ def test_m3_ultra_60c_is_its_own_device():
 
 def test_unmeasured_backends_have_no_borrowed_tuning():
     configs = load_configs()
-    for name in ('apple-m2-max-30c', 'apple-m3-max-30c', 'apple-m4-pro-16c', 'apple-m5-max-32c'):
+    for name in ('apple-m3-max-30c', 'apple-m4-pro-16c', 'apple-m5-max-32c'):
         config = configs[name]
         assert config.validation == 'unmeasured'
         assert config.accelerator == 'off'
@@ -81,6 +81,15 @@ def test_unmeasured_backends_have_no_borrowed_tuning():
         assert config.threadgroups_per_core == 1
     assert configs['apple-m5-max-40c'].validation == 'measured'
     assert configs['apple-m5-max-40c'].gdn_mixer_fusion['workers'] == 80
+
+
+def test_m2_matrix_policy_has_its_own_measurements():
+    config = load_configs()['apple-m2-max-30c']
+    assert config.validation == 'measured' and config.accelerator == 'on'
+    assert set(config.accelerator_min_t) == {'bf16', 'fp8', 'nvfp4', 'int8', 'int4_affine'}
+    assert not config.gdn_mixer_fusion
+    assert config.raw['matrix_calibration']['lane_order_measured_with'] == config.lane_order
+    assert config.raw['matrix_calibration']['scale_placement'] == config.scale_placement
 
 
 @pytest.mark.parametrize('chip,cores,family', [
@@ -120,7 +129,8 @@ def test_m2_max_compiles_native_hybrid_program(tmp_path, tokens):
     assert program.config_digest == config.fingerprint
     functions = {kernel.function for kernel in program.kernels.values()}
     assert {'gemv_T', 'gdn_mixer', 'gdn_norm', 'gqa_decode', 'gqa_merge'} <= functions
-    assert 'gemm_tile' not in functions and 'gdn_mixer_megakernel' not in functions
+    assert ('gemm_tile' in functions) == (tokens >= config.accelerator_min_t['bf16'])
+    assert 'gdn_mixer_megakernel' not in functions
     assert all(kernel.macros.get('FUSED_NORM') != '1' for kernel in program.kernels.values())
     assert get_backend(config.backend).cache_identity(config).startswith('m2_max_30c-30c-')
 
