@@ -69,7 +69,13 @@ kernel void gemv_bf16_rows(device const bfloat4* w [[buffer(0)]], device const f
   float4 x;
   for(uint e=0;e<4;e++)x[e]=round_bf16(norm_scale(raw[e], rn, nw[e]));
 #else
+#if COOP_A9
+  const uint xs0=xperm_slot(4u*k);
+  device const bfloat* xs=reinterpret_cast<device const bfloat*>(xp);
+  const float4 x=float4(xs[xs0],xs[xs0+8u],xs[xs0+16u],xs[xs0+24u]);
+#else
   const float4 x=float4(xp[bf16_slot4(k)]);
+#endif
 #endif
 #pragma clang loop unroll(full)
   for(uint r=0;r<BF_ROWS;r++){

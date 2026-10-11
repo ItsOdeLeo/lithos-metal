@@ -9,6 +9,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from monolith import kernels
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from dspark_synth import build, write_checkpoint  # noqa: E402
 
@@ -54,6 +56,8 @@ def test_draft_program_matches_oracle(tmp_path, threshold, yarn, head_dim, fused
     prof = profile_for_device(info.gpu_cores, info.apple_family)
     if prof is None:
         pytest.skip("no chip profile for this device")
+    if fused and kernels.coop_layout() != "apple10":
+        pytest.skip("the fused draft program's static tasks require Apple10")
     if fused:
         import copy
         prof = copy.deepcopy(prof)

@@ -40,6 +40,9 @@ def test_cooperative_layout_matches_the_fill_formula(dev, tm, tn, tk):
     r = nt.Queue(dev).run([nt.Dispatch().pipeline(pso).buffer(0, out).grid(1).threadgroup(32)])
     assert not r.error, r.error
     a = np.frombuffer(out.read(0, 32 * stride * 4), dtype=np.int32).reshape(32, stride)
+    if kernels.coop_layout() == "apple9":
+        _check_apple9_layout(a, tm, tn, tk)
+        return
     nb_c, ns_b, nj_c = max(tm, 16) // 16, tn // 8, tn // 16
     for lane in range(32):
         cap_b, cap_c = int(a[lane, 0]), int(a[lane, 1])
@@ -57,15 +60,37 @@ def test_cooperative_layout_matches_the_fill_formula(dev, tm, tn, tk):
             assert tuple(rec[i]) == (1 if m < tm else 0, n, m), (lane, i, rec[i])
 
 
+def _check_apple9_layout(a, tm, tn, tk):
+    """Apple9 (8 × 8 matrices): thread ``lane`` holds the reduction slots kr + 8·jj (kr = bits 1, 2 + 4·bit 4) of the
+    rows nc + e + 8·s (nc = 2·bit 0 + 4·bit 3), element (TN/4)·jj + 2·s + e; the destination the tokens kr + 8·mb of
+    the same rows, element (TN/4)·mb + 2·s + e, every one valid (no padded token rows)."""
+    for lane in range(32):
+        cap_b, cap_c = int(a[lane, 0]), int(a[lane, 1])
+        assert cap_b == tn * tk // 32 and cap_c == (tm // 8) * (tn // 4)
+        kr, nc = ((lane >> 1) & 3) + 4 * ((lane >> 4) & 1), 2 * (lane & 1) + 4 * ((lane >> 3) & 1)
+        rec = a[lane, 4:4 + 3 * cap_b].reshape(cap_b, 3)
+        for i in range(cap_b):
+            jj, rr = divmod(i, tn // 4)
+            assert tuple(rec[i]) == (1, kr + 8 * jj, nc + (rr & 1) + 8 * (rr >> 1)), (lane, i, rec[i])
+        rec = a[lane, 4 + 3 * cap_b:4 + 3 * cap_b + 3 * cap_c].reshape(cap_c, 3)
+        for i in range(cap_c):
+            mb, rr = divmod(i, tn // 4)
+            assert tuple(rec[i]) == (1, nc + (rr & 1) + 8 * (rr >> 1), kr + 8 * mb), (lane, i, rec[i])
+
+
 def test_x_permute_column_order():
     kl = K // 32
-    perm = kernels.x_permute_columns(K, 32, tk=64)
+    perm = kernels.x_permute_columns(K, 32, tk=64, layout="apple10")
     assert sorted(perm.tolist()) == list(range(K))
     # slot (bit0, bit3, jump, q) of a tile <-> pack column (TK/4)·(bit0 + 2·bit3) + 4·jump + q; pack column 32 = lane 1's word 0
     assert perm[:4].tolist() == [0, 1, 2, 3] and perm[4] == 16 and perm[8] == kl and perm[16] == 4 and perm[64] == 2 * kl
-    perm = kernels.x_permute_columns(K, 32, tk=256)                     # the default tile: quarters of 64 columns
+    perm = kernels.x_permute_columns(K, 32, tk=256, layout="apple10")   # the default tile: quarters of 64 columns
     assert sorted(perm.tolist()) == list(range(K))
     assert perm[4] == 2 * kl and perm[8] == 4 * kl and perm[16] == 4 and perm[64] == 16 and perm[256] == 8 * kl
+    # Apple9: slot kr + 8·jj <- tile column (tk/8)·kr + jj; at tk = 256 a thread's 32 slots are lane kr's word 0
+    perm = kernels.x_permute_columns(K, 32, tk=256, layout="apple9")
+    assert sorted(perm.tolist()) == list(range(K))
+    assert perm[:8].tolist() == [l * kl for l in range(8)] and perm[8] == 1 and perm[16] == 2 and perm[256] == 8 * kl
 
 
 def _run(dev, fmt, n, k, tm, t_act, lane_order, out_bf16=False, rows=16, tn=None, tk=None, ksplit=1, placement="inline", specialize=False):
@@ -75,7 +100,12 @@ def _run(dev, fmt, n, k, tm, t_act, lane_order, out_bf16=False, rows=16, tn=None
     f = FORMATS.get(fmt)
     x = rng.uniform(-1, 1, size=(t_act, k)).astype(np.float32)
     xb = f32_to_bf16(x)
-    macros = kernels.gemm_macros(info, tm=tm, out_bf16=out_bf16, tn=tn, tk=tk, ksplit=ksplit)
+    try:
+        macros = kernels.gemm_macros(info, tm=tm, out_bf16=out_bf16, tn=tn, tk=tk, ksplit=ksplit)
+    except ValueError as e:
+        if "on Apple9" in str(e):
+            pytest.skip(f"a tile shape the Apple9 cooperative layout does not take: {e}")
+        raise
     tn, tk = int(macros["TN"].rstrip("u")), int(macros["TK"].rstrip("u"))
     lib = _lib(dev, fmt, macros)
     pso, ppso = nt.Pipeline(lib, "gemm_tile"), nt.Pipeline(_lib(dev, fmt, dict(macros, **kernels.x_permute_macros(False))), "x_permute")

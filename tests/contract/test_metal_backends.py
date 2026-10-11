@@ -18,7 +18,7 @@ from monolith.runtime.program import KernelSpec, OpSpec, Program
 
 @pytest.mark.parametrize('name,cores,family,backend', [
     ('Apple M2 Max', 30, 8, 'm2_max_30c'),
-    ('Apple M3 Pro', 18, 9, 'm3_pro'), ('Apple M3 Max', 30, 9, 'm3_max_30c'),
+    ('Apple M3 Pro', 18, 9, 'm3_pro'), ('Apple M3 Max', 30, 9, 'm3_max_30c'), ('Apple M3 Ultra', 60, 9, 'm3_ultra_60c'),
     ('Apple M4 Pro', 16, 9, 'm4_pro'),
     ('Apple M4 Pro', 20, 9, 'm4_pro'), ('Apple M5 Pro', 20, 10, 'm5_pro'),
     ('Apple M5 Max', 32, 10, 'm5_max_32c'), ('Apple M5 Max', 40, 10, 'm5_max_40c'),
@@ -64,9 +64,16 @@ def test_m3_max_draft_context_is_capped_and_other_chips_are_not():
     assert get_backend('common').serving_context_limit(drafter=True) is None
 
 
+def test_m3_ultra_60c_is_its_own_device():
+    assert config_for_device(60, 9, 'Apple M3 Ultra').backend == 'm3_ultra_60c'
+    for name, cores, family in (('Apple M3 Ultra', 80, 9), ('Apple M3 Max', 60, 9), ('Apple M3 Ultra', 30, 9)):
+        assert config_for_device(cores, family, name) is None
+    assert get_backend('m3_ultra_60c').serving_context_limit(drafter=True) is None
+
+
 def test_unmeasured_backends_have_no_borrowed_tuning():
     configs = load_configs()
-    for name in ('apple-m2-max-30c', 'apple-m3-max-30c', 'apple-m4-pro-16c', 'apple-m4-pro-20c', 'apple-m5-max-32c'):
+    for name in ('apple-m2-max-30c', 'apple-m3-max-30c', 'apple-m4-pro-16c', 'apple-m5-max-32c'):
         config = configs[name]
         assert config.validation == 'unmeasured'
         assert config.accelerator == 'off'

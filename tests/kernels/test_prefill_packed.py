@@ -14,6 +14,8 @@ from monolith.formats.fp import bf16_to_f32, f32_to_bf16
 from monolith.runtime import Engine, _native as nt
 from monolith.runtime.program import BufferSpec, KernelSpec, OpSpec, Program
 
+pytestmark = pytest.mark.skipif(kernels.coop_layout() != 'apple10', reason='packed prefill operands require Apple10')
+
 
 @pytest.mark.parametrize('fmt,tm,tn,block', [('nvfp4', 16, 32, 1), ('nvfp4', 32, 16, 1),
                                           ('fp8_e4m3', 32, 16, 1), ('fp8_e4m3', 32, 16, 8),
