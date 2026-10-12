@@ -1,0 +1,42 @@
+name: mac-slash
+
+# `/mac-test` and `/release-gate` on a pull request (tools/ci/mac_slash.py). An issue_comment run always uses the
+# default branch's copy of this file and checks out the default branch, never the pull request: this job can
+# dispatch workflows and write statuses, so no pull request may change what it runs.
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  actions: write
+  statuses: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  dispatch:
+    # Any comment that mentions a command starts this job; mac_slash.parse() decides whether it is one.
+    if: >-
+      github.event.issue.pull_request &&
+      (contains(github.event.comment.body, '/mac-test') || contains(github.event.comment.body, '/release-gate'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          sparse-checkout: tools/ci
+      - name: Dispatch
+        env:
+          # The comment is untrusted text: it reaches the script through the environment, never through `${{ }}`
+          # inside `run:`.
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          ACTOR: ${{ github.event.comment.user.login }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          MAC_CI_RUNNERS: ${{ vars.MAC_CI_RUNNERS }}
+          GH_TOKEN: ${{ github.token }}
+        run: python3 tools/ci/mac_slash.py

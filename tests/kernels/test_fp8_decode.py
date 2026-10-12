@@ -8,7 +8,7 @@ from monolith.formats.fp import e4m3_to_f32
 from monolith.runtime import _native as nt
 
 
-@pytest.mark.parametrize('mode', [0, 1])
+@pytest.mark.parametrize('mode', [0, 1, 2])
 def test_fp8_decode_word_all_finite_codes(mode):
     dev = nt.Device()
     source = kernels.PRELUDE + FORMATS.get('fp8_e4m3').msl_decode + '''

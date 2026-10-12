@@ -60,8 +60,9 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 ```
 
 The server provides **Chat Completions, Responses, and Anthropic Messages** adapters with text generation,
-tool calls, and SSE streaming. One generation runs at a time. Responses is stateless, and tools execute in the
-client. See the [serving design](docs/design/serving.md) for protocol support, caching, sampling, and API limits.
+tool calls, and SSE streaming, plus Ollama's `/api/chat` for Ollama clients. One generation runs at a time.
+Responses is stateless, and tools execute in the client. See the [serving design](docs/design/serving.md) for
+protocol support, caching, sampling, and API limits.
 
 ## Models and hardware
 
@@ -70,6 +71,7 @@ These target/draft pairs are selected automatically by the serving CLI. Run `lit
 | Target model | Automatic DSpark head |
 | --- | --- |
 | [Qwen3.8-27B-NVFP4](https://huggingface.co/nvidia/Qwen3.8-27B-NVFP4) | [LithosAI/Qwen3.8-27B-DSpark-NVFP4](https://huggingface.co/LithosAI/Qwen3.8-27B-DSpark-NVFP4) |
+| [Qwen3.8-27B-4bit](https://huggingface.co/mlx-community/Qwen3.8-27B-4bit) (affine 4-bit) | [LithosAI/Qwen3.8-27B-DSpark-NVFP4](https://huggingface.co/LithosAI/Qwen3.8-27B-DSpark-NVFP4) |
 | [Qwen3.6-35B-A3B-NVFP4](https://huggingface.co/nvidia/Qwen3.6-35B-A3B-NVFP4) | [LithosAI/Qwen3.6-35B-A3B-DSpark-NVFP4](https://huggingface.co/LithosAI/Qwen3.6-35B-A3B-DSpark-NVFP4) |
 
 The 35B hybrid MoE integration is experimental; its [adapter design](docs/design/models.md#qwen-hybrid-moe-model) describes
@@ -83,7 +85,10 @@ see the [model adapter design](docs/design/models.md) for supported structures a
 | M3 Pro, 18 GPU cores | Probe-derived configuration |
 | M2 Max, 30 GPU cores | Native shaders with direct encoding; qualification and limits in the [backend notes](monolith/backends/metal/m2_max_30c/README.md) |
 | M3 Max, 30 GPU cores | Unmeasured native fallback; DSpark serving fits through 20480 context on 36 GB |
-| M4 Pro, 16 or 20 GPU cores | Unmeasured native fallback |
+| M3 Ultra, 60 GPU cores | Measured profile with the Apple9 matrix tile |
+| M4 Pro, 20 GPU cores | Measured profile with the Apple9 matrix tile |
+| M4 Pro, 16 GPU cores | Unmeasured native fallback |
+| M4 Max, 32 or 40 GPU cores | Unmeasured native fallback |
 | M5 Max, 32 GPU cores | Independent, unmeasured native fallback |
 
 Backend selection uses the chip name, GPU family, and core count. Unmeasured backends have no automatic

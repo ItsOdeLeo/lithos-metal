@@ -36,7 +36,7 @@ def _module(hidden, hk, hv, dk, dv, seed):
 
 
 class Harness:
-    def __init__(self, dev, m, t_max, *, ab_separate=False, slice_cols=8, slices_per_block=4, tokens_per_pass=None, prepared=False, perm_out=None, fused_norm=False, specialize=False, local_prepare=False, local_groups=None, single_pass=False):
+    def __init__(self, dev, m, t_max, *, ab_separate=False, slice_cols=8, slices_per_block=4, tokens_per_pass=None, prepared=False, perm_out=None, fused_norm=False, specialize=False, local_prepare=False, local_groups=None, single_pass=False, tree_reduce=False):
         """The engine's configuration: two state slots by step parity read from StepState (a single slot races when
         several value heads share a key head's conv window — the kernel's note)."""
         from monolith.core import StepStateLayout
@@ -62,6 +62,9 @@ class Harness:
         if single_pass:
             assert local_prepare and t_max <= int(macros["TP"].rstrip("u"))
             macros["SINGLE_PASS"] = "1"
+        if tree_reduce:
+            assert slice_cols == 4
+            macros["TREE_REDUCE"] = "1"
         self.source = kernels.gdn_source().replace(kernels.PRELUDE, kernels.PRELUDE + self.layout.to_msl() + "\n", 1)
         self.macros, self.specialize = macros, specialize
         lib = nt.Library(dev, self.source, macros)
@@ -415,6 +418,21 @@ def test_prefill_register_resident_recurrence(dev, t):
     for active, done in [(t, False), (1, False), (t-1, False), (0, False), (t, False), (t, True)]:
         proj = _proj(rng, torch, t, m.in_proj.n)
         np.testing.assert_array_equal(*[h.step(proj, t_active=active, done=done) for h in hs])
+        for attr, size in (('conv_state', 2*hs[0].conv_bytes), ('rec_state', 2*hs[0].rec_bytes)):
+            assert getattr(hs[0], attr).read(0, size) == getattr(hs[1], attr).read(0, size)
+
+
+@pytest.mark.parametrize('t', [128, 512])
+def test_prefill_tree_reduction_is_simd_sum_bit_for_bit(dev, t):
+    """TREE_REDUCE (the M5 Max prompt programs, SL = 4): the four columns' lane sums in one butterfly give the bits of
+    four simd_sums, outputs and both states, over full, partial and one-token passes."""
+    torch = pytest.importorskip('torch')
+    m, rng = _module(64, 8, 16, 128, 128, seed=227)
+    hs = [Harness(dev, m, t, prepared=True, slice_cols=4, slices_per_block=1, tokens_per_pass=t, ab_separate=True,
+                  specialize=True, tree_reduce=tree) for tree in (False, True)]
+    for active in (t, 1, t - 1, 37, t):
+        proj = _proj(rng, torch, t, m.in_proj.n)
+        np.testing.assert_array_equal(*[h.step(proj, t_active=active) for h in hs])
         for attr, size in (('conv_state', 2*hs[0].conv_bytes), ('rec_state', 2*hs[0].rec_bytes)):
             assert getattr(hs[0], attr).read(0, size) == getattr(hs[1], attr).read(0, size)
 

@@ -83,13 +83,20 @@ kernel void gemv_bf16_small(device const uint4* w [[buffer(0)]], device const fl
       const float4 nw = *(device const float4*)(norm_w + col);
       bfloat4 val;
       for (uint e = 0; e < 4; e++) val[e] = bfloat(round_bf16(norm_scale(raw[e], rn, nw[e])));
+#if COOP_A9
+      threadgroup bfloat* ls = reinterpret_cast<threadgroup bfloat*>(local_x) + nv * K + xperm_slot(4u * i);
+      for (uint e = 0; e < 4; e++) ls[8u * e] = val[e];
+#else
       local_x[nv * (K / 4u) + packed_slot4(i)] = val;
+#endif
     }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   threadgroup const bfloat4 *x4 = local_x;
+  threadgroup const bfloat *xs1 = reinterpret_cast<threadgroup const bfloat*>(local_x);
 #else
   device const bfloat4 *x4 = (device const bfloat4*)xp;
+  device const bfloat *xs1 = reinterpret_cast<device const bfloat*>(xp);
 #endif
   for (uint vc = 0; vc < T_act; vc += VECTORS) {
     float result[VECTORS] = {0};
@@ -101,7 +108,14 @@ kernel void gemv_bf16_small(device const uint4* w [[buffer(0)]], device const fl
       for (uint v = 0; v < VECTORS; v++) {
         float acc = 0;
 #pragma clang loop unroll(full)
+#if COOP_A9
+        for (uint j = 0; j < 8; j++) if (base+j*KLANES+klane<K/4u) {
+          const uint xi = min(vc+v,T_act-1u)*K + xperm_slot(4u*(base+j*KLANES+klane));
+          acc+=dot(wf[j],float4(xs1[xi],xs1[xi+8u],xs1[xi+16u],xs1[xi+24u]));
+        }
+#else
         for (uint j = 0; j < 8; j++) if (base+j*KLANES+klane<K/4u) acc+=dot(wf[j],float4(x4[min(vc+v,T_act-1u)*(K/4u)+packed_slot4(base+j*KLANES+klane)]));
+#endif
         result[v]+=acc;
       }
     }

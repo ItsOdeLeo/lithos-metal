@@ -2,10 +2,15 @@
 import numpy as np
 import pytest
 
+from monolith import kernels
+
 from monolith.formats.fp import f32_to_bf16
 from monolith.runtime import Engine, _native as nt
 from tools.bench.gdn_block_bench import fixture, program, initialize, checked_run, snapshot
 from tools.bench.gdn_block_static import normalize, merge
+
+
+APPLE10 = pytest.mark.skipif(kernels.coop_layout() != 'apple10', reason='static megakernel tasks require Apple10')
 
 
 @pytest.fixture(scope='module')
@@ -20,6 +25,7 @@ def block(tmp_path_factory):
     return dev, module, program(dev, module, pack)
 
 
+@APPLE10
 @pytest.mark.parametrize('sgs,workers,tn,split,extra,sync', [
     (4,4,16,False,{},{}), (16,8,16,False,{},{}),
     (8,8,32,True,{},{}), (16,8,32,True,{},{}),
@@ -108,7 +114,7 @@ def test_ragged_multi_team_projection_is_rejected(block):
     with pytest.raises(ValueError,match='ragged multi-team'):
         normalize(p,16,groups=8,tn=16,ksplit=2,compact=True)
 
-
+@APPLE10
 def test_mixed_nonpower_projection_splits_preserve_state(tmp_path):
     """Input/output widths can use different divisors in the same worker."""
     pytest.importorskip('torch')
@@ -131,6 +137,7 @@ def test_mixed_nonpower_projection_splits_preserve_state(tmp_path):
     assert snapshot(engines[0],2560)==snapshot(engines[1],2560)
 
 
+@APPLE10
 @pytest.mark.parametrize('tk',[64,128,256])
 def test_staged_reduction_tiles_preserve_state(block,tk):
     dev,module,p=block
@@ -164,6 +171,7 @@ kernel void values(device ushort* out [[buffer(0)]], uint i [[thread_position_in
     np.testing.assert_array_equal(actual[finite],expected[finite])
 
 
+@APPLE10
 @pytest.mark.parametrize('tn,ks,outer,decoder,mode,tk,prefetch,tile_block',[
     (16,16,1,'standard','coop',32,0,1),(32,4,0,'standard','coop',32,0,1),
     (16,2,0,'half_operand','coop',32,0,1),(32,1,1,'vector','coop',32,0,1),
@@ -192,6 +200,7 @@ def test_fp8_tile_pack_is_lossless_in_the_complete_mixer(block,tn,ks,outer,decod
     assert snapshot(engines[0],1024)==snapshot(engines[1],1024)==snapshot(engines[2],1024)
 
 
+@APPLE10
 @pytest.mark.parametrize('storage',['bf16','half'])
 def test_predecoded_fp8_storage_preserves_values(block,storage):
     dev,module,p=block

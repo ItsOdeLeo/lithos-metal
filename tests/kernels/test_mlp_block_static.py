@@ -2,6 +2,8 @@
 import numpy as np
 import pytest
 
+from monolith import kernels
+
 from monolith.bench import profile_for_device
 from monolith.compiler import emit_program
 from monolith.compiler.passes import DEFAULT_PASSES
@@ -15,6 +17,8 @@ from monolith.packs.packer import Packer, PackFile
 from monolith.runtime import Engine, _native as nt
 from tools.bench.gdn_block_bench import checked_run
 from tools.bench.gdn_block_static import normalize, merge
+
+pytestmark = pytest.mark.skipif(kernels.coop_layout() != 'apple10', reason='static megakernel tasks require Apple10')
 
 
 @pytest.fixture(scope='module',params=['block','inline'])

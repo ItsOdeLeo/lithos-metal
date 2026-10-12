@@ -53,6 +53,10 @@ class MetalBackend:
         for path in sorted(implementation):
             digest.update(path.relative_to(root).as_posix().encode())
             digest.update(path.read_bytes())
+        from ...formats import FORMATS                       # the format plugins' decode sources are kernel source too
+        for name in sorted(FORMATS.names()):
+            digest.update(name.encode())
+            digest.update(FORMATS.get(name).msl_decode.encode())
         return f"{self.id}-{config.gpu_cores}c-{digest.hexdigest()[:16]}"
 
     def finalize(self, program, graph, emitted, config, **options):
@@ -77,6 +81,6 @@ class MetalBackend:
         """Only opt matching workloads into recipes validated on this chip."""
         return {}
 
-    def serving_prefill_chunk(self, recipes):
+    def serving_prefill_chunk(self, recipes, model=None):
         """Prompt rows per pass that ``optimize_prefill`` is tuned for on a served workload, if any."""
         return None

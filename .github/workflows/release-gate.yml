@@ -1,0 +1,157 @@
+name: release-gate
+run-name: >-
+  release-gate ${{ inputs.pr && format('PR #{0} ', inputs.pr) || '' }}${{ inputs.git_ref || github.ref_name }}
+  ${{ inputs.runner }}
+
+# This build against the previous release on real models, on bare-metal Macs (tools/ci/release_gate.py,
+# docs/ci.md): identical greedy outputs, no decode or TTFT regression beyond the runs' own noise. A release tag
+# publishes only a commit with a passing `release-gate (<runner>)` status (release.yml). Dispatch it on the release
+# commit before tagging, or comment `/release-gate` on a pull request.
+
+on:
+  workflow_dispatch:
+    inputs:
+      git_ref:
+        description: "Commit or branch to gate (default: the ref the run is dispatched on)"
+        type: string
+        default: ""
+      runner:
+        description: "Runner label (default: every label in vars.MAC_CI_RUNNERS)"
+        type: string
+        default: ""
+      baseline:
+        description: "Release tag to compare with (default: the newest published release behind the commit)"
+        type: string
+        default: ""
+      expect_output_change:
+        description: "Outputs may differ from the baseline's (a deliberate numerics change)"
+        type: boolean
+        default: false
+      pr:
+        description: "Pull request the run belongs to (set by /release-gate)"
+        type: string
+        default: ""
+
+concurrency:
+  group: release-gate-${{ inputs.pr && format('pr{0}', inputs.pr) || inputs.git_ref || github.ref }}-${{ inputs.runner }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.plan.outputs.sha }}
+      runners: ${{ steps.plan.outputs.runners }}
+    steps:
+      - id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GIT_REF: ${{ inputs.git_ref || github.sha }}
+          RUNNER: ${{ inputs.runner }}
+          RUNNERS: ${{ vars.MAC_CI_RUNNERS }}
+        run: |
+          set -euo pipefail
+          sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GIT_REF" --jq .sha)
+          if [ -n "$RUNNER" ]; then
+            runners=$(jq -cn --arg r "$RUNNER" '[$r]')
+          else
+            runners=$(printf '%s' "${RUNNERS:-[]}" | jq -c 'if type == "array" then . else error("MAC_CI_RUNNERS must be a JSON list") end')
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "runners=$runners" >> "$GITHUB_OUTPUT"
+          echo "gating $sha on $runners"
+
+  bundle:
+    # The bundle a tag of this commit publishes, built once as release.yml would build it; every runner gates these
+    # bytes and release.yml publishes them (docs/ci.md).
+    needs: plan
+    if: needs.plan.outputs.runners != '[]'
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python tools/release/build_macos.py --repository "$GITHUB_REPOSITORY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-bundle
+          path: dist/
+          if-no-files-found: error
+
+  gate:
+    needs: [plan, bundle]
+    if: needs.plan.outputs.runners != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJson(needs.plan.outputs.runners) }}
+    runs-on: [self-hosted, macOS, ARM64, "${{ matrix.runner }}"]
+    # Installing two bundles, a first download and pack of each model by each build, then twelve server boots.
+    timeout-minutes: 600
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+          fetch-depth: 0          # the release tags: the default baseline is the newest one behind this commit
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-bundle
+          path: ${{ runner.temp }}/release-bundle
+      - name: Release gate
+        env:
+          BASELINE: ${{ inputs.baseline || 'auto' }}
+          EXPECT: ${{ inputs.expect_output_change && '--expect-output-change' || '' }}
+        run: >-
+          "${LITHOS_CI_PYTHON:-python3}" tools/ci/release_gate.py
+          --root "${LITHOS_CI_ROOT:?the runner .env must set LITHOS_CI_ROOT}"
+          --baseline-ref "$BASELINE" --candidate-bundle "$RUNNER_TEMP/release-bundle"
+          --report-dir "$RUNNER_TEMP/release-gate" $EXPECT
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: release-gate-${{ matrix.runner }}
+          path: ${{ runner.temp }}/release-gate
+          if-no-files-found: ignore
+
+  report:
+    needs: [plan, gate]
+    # Also after a failed plan or a cancellation, so the pending status a slash command set always ends: a run a
+    # maintainer cancelled reports an error, while one a newer run replaced finds the newer status and leaves it
+    # (tools/ci/ci_status.py checks right before each write).
+    if: ${{ always() && (needs.plan.result != 'success' || needs.plan.outputs.runners != '[]') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read      # when this run started (tools/ci/ci_status.py)
+      contents: read
+      statuses: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          sparse-checkout: tools/ci
+      - uses: actions/download-artifact@v4
+        # A job that failed before writing its result uploads nothing; the next step reports that runner as an error.
+        continue-on-error: true
+        with:
+          pattern: release-gate-*
+          path: results
+      - name: Set the commit statuses
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.plan.outputs.sha || inputs.git_ref || github.sha }}
+          RUNNERS: ${{ needs.plan.outputs.runners || (inputs.runner && format('["{0}"]', inputs.runner)) || '[]' }}
+        run: >-
+          python3 tools/ci/ci_status.py --context release-gate --sha "$SHA" --runners "$RUNNERS"
+          --results results --artifact-prefix release-gate-
+          --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"

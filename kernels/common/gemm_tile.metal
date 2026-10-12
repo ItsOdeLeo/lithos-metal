@@ -33,12 +33,23 @@
 // and are not written). Measured on the M5 Pro at 17408 x 5120: NVFP4 177 GB/s, FP8 253, INT4 204 at 8 or 16 tokens
 // — 0.9-1.1x a T = 1 GEMV pass — against p14's staged tile (119 / 186); at 32 tokens the un-overlapped fill and
 // the activation traffic leave it below the staged tile (a multi-SIMD-group staged variant is the follow-up).
+//
+// COOP_A9 (set by kernels.gemm_source for an Apple9 GPU — M3, M4): those GPUs lay a SIMD-group's cooperative tensors
+// out as 8 x 8 matrices (measured with coop_layout; tests/kernels/test_gemm_tile.py): thread `lane` holds, for the
+// right operand, the reduction slots kr + 8*jj (kr = bits 1,2 + 4*bit4) of the rows nc + e + 8*s (nc = 2*bit0 + 4*bit3,
+// e = 0, 1), element (TN/4)*jj + 2*s + e, and for the destination the tokens kr + 8*mb of the same rows, element
+// (TN/4)*mb + 2*s + e (no padding: TM rows exactly). The fill keeps its shape — the reduction slots are permuted so
+// that a thread's TK/8 slots of each row are TK/8 consecutive pack columns (x_permute orders x' the same way) — over
+// twice the rows and half the columns of the Apple10 layout; the epilogue reads the pairs of adjacent rows.
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 using namespace metal;
 using namespace mpp::tensor_ops;
 
 #ifndef OUT_BF16
 #define OUT_BF16 0
+#endif
+#ifndef TB2
+#define TB2 0                        // 1: each SIMD group multiplies its decoded weight tile with two TM-token blocks
 #endif
 #ifndef STEP_STATE
 #define STEP_STATE 0                 // 1: the row count comes from StepState (buffer 15) and the dispatch is a per-T variant
@@ -109,16 +120,38 @@ using namespace mpp::tensor_ops;
 #define LPT (TK / WPW)                                    // lanes (pack words) per K tile
 #define KT (K / TK)                                       // K tiles per row
 #define NB (TN / R)                                       // pack blocks per row tile
+#ifndef COOP_A9
+#define COOP_A9 0
+#endif
+#if COOP_A9
+#define CT (TK / 8u)                                      // a thread's consecutive columns per row (an eighth: slots kr + 8*jj)
+#else
 #define CT (TK / 4u)                                      // a thread's consecutive columns per row (its quad's quarter)
+#endif
 #define NW ((CT >= WPW) ? (CT / WPW) : 1u)                // words holding them (one half-word when CT < WPW)
 #define NCH (CT / 16u)                                    // 16-column chunks of them (one block scale each)
 #if SCALE_GROUP > 0 && (SCALE_GROUP % 16) != 0
 #error "gemm_tile: the block scale group must be a multiple of 16 columns"
 #endif
 #define NS_B (TN / 8u)                                    // row slots per thread in the right operand
+#if COOP_A9
+#define ROWS_T (2u * NS_B)                                // rows per thread in the right operand (Apple9: pairs)
+#else
+#define ROWS_T NS_B
+#endif
 #define NB_C ((TM > 16u) ? (TM / 16u) : 1u)               // 16-row blocks of the destination (its element order is
                                                           // q, slot (2), jump (TN/16), block — the right operand's is q, slot (8), jump)
+#if COOP_A9
+#define C_CAP ((TM / 8u) * (TN / 4u))                     // destination elements per thread (TM rows × TN over 32 lanes)
+#if (CT < WPW) && (CT * 2u != WPW)
+#error "gemm_tile (Apple9): a thread's columns must be whole words or one half-word (TK/8 >= WPW/2)"
+#endif
+#if SCALE_GROUP > 0 && CT < 16u
+#error "gemm_tile (Apple9): one block scale per 16 columns needs TK/8 >= 16"
+#endif
+#else
 #define C_CAP (NB_C * TN / 2u)                            // destination elements per thread (16 · NB_C rows × TN over 32 lanes)
+#endif
 // Opt-in after whole-layer measurement: compacting scratch can also change
 // register allocation. The hardware accumulator covers at least 16 token rows.
 #ifndef COMPACT_PARTIALS
@@ -128,6 +161,10 @@ using namespace mpp::tensor_ops;
 #define PART_TOKENS T_HI
 #else
 #define PART_TOKENS TM
+#endif
+#if COOP_A9 && COMPACT_PARTIALS                          // Apple9: the destination has no padded token rows to compact
+#undef COMPACT_PARTIALS
+#define COMPACT_PARTIALS 0
 #endif
 #if COMPACT_PARTIALS && PART_TOKENS <= 8 && TM <= 16
 #define PART_CAP (C_CAP / 2u)
@@ -206,8 +243,18 @@ static inline uint narrow_scale_word(device const uint4* wb, uint ln, uint r, ui
 #define BLOCK_WORDS (R * 32u * UNIT_WORDS)
 #endif
 
-constexpr constant auto desc = matmul2d_descriptor(int(TM), int(TN), int(TK), false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
+#ifndef STAGE_B
+#define STAGE_B 0                    // 1: STAGE_SB SIMD groups (one TM-token block each) share each row tile's decoded weights
+#endif                               // through threadgroup memory: the injected fill writes them, one barrier per K step
+#ifndef SPLIT_K
+#define SPLIT_K 0                    // 1: the injected fill (compiler/prefill.py) multiplies each 128-column tile as two 64-deep
+#endif                               // products, each right after decoding its half: matmul2d sums K in order, same results
+#if COOP_A9 && (TB2 || STAGE_B || SPLIT_K)
+#error "two token blocks, staged weights and the split fill assume the Apple10 cooperative layout"
+#endif
+constexpr constant auto desc = matmul2d_descriptor(int(TM), int(TN), SPLIT_K ? 64 : int(TK), false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
 using tA_t = tensor<device bfloat, dextents<int, 2>, tensor_inline>;
+using tB_s = tensor<threadgroup bfloat, dextents<int, 2>, tensor_inline>;
 
 kernel void gemm_tile(device const uint4* w [[buffer(0)]], device const float* row_scale [[buffer(1)]],
                       device bfloat* xp [[buffer(2)]],
@@ -233,11 +280,21 @@ kernel void gemm_tile(device const uint4* w [[buffer(0)]], device const float* r
                       device const StepState* st [[buffer(15)]],
 #endif
                       uint3 gid [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]], uint sw [[threads_per_simdgroup]],
+#if STAGE_B
+                      uint3 planes [[threadgroups_per_grid]],
+#endif
                       uint3 group [[threadgroup_position_in_grid]]) {
   const uint sg = gid.x / sw;
 #if KSPLIT > 1
   const uint slice = sg % KSPLIT, sg_tile = sg / KSPLIT, n_tg = p.n_sg / KSPLIT;   // a threadgroup is the KSPLIT SIMD-groups of one tile
   threadgroup float part[KSPLIT - 1][PART_LANES][PART_CAP];                            // the partial tiles of slices 1 … KSPLIT-1
+#elif STAGE_B
+#if TB2 || POST_NORM
+#error "staged weights take one token block per SIMD group"
+#endif
+  threadgroup bfloat stage_b[2u * TN * TK];
+  const uint sgi = (gid.x / sw) % STAGE_SB;                              // this SIMD group's token block in the threadgroup
+  const uint sg_tile = group.x, n_tg = planes.x;                         // one row tile per threadgroup at a time
 #else
   const uint sg_tile = sg, n_tg = p.n_sg;
 #endif
@@ -253,9 +310,23 @@ kernel void gemm_tile(device const uint4* w [[buffer(0)]], device const float* r
 #endif
   // Each grid.y plane processes at most TM tokens. Predication above uses the
   // full step length; all following addressing and guards are local to this tile.
-  const uint token0 = group.y * TM;
+#if STAGE_B
+  // grid.y covers STAGE_SB token blocks per threadgroup; a block past the step still decodes and meets the barriers
+  if (group.y * STAGE_SB * TM >= T_act) return;                         // uniform: the whole threadgroup is past the step
+  const uint token0 = (group.y * STAGE_SB + sgi) * TM;
+  const bool live = token0 < T_act;
+  T_act = live ? min(T_act - token0, uint(TM)) : 0u;
+#else
+  uint token0 = group.y * TM * (TB2 ? 2u : 1u);
   if (token0 >= T_act) return;
+#if TB2
+  // Two token blocks share every weight-tile fill; the second block's epilogue reuses the first's code.
+  const uint T_all = min(T_act - token0, 2u * TM);
+  T_act = min(T_all, uint(TM));
+#else
   T_act = min(T_act - token0, uint(TM));
+#endif
+#endif
   xp += (ulong)token0 * K;
   const uint output_cols = (EPILOGUE == 2) ? p.n_rows / 2u : p.n_rows;
   y += (ulong)token0 * output_cols;
@@ -267,18 +338,39 @@ kernel void gemm_tile(device const uint4* w [[buffer(0)]], device const float* r
 #endif
   matmul2d<desc, execution_simdgroup> op;
   tA_t tA(xp, dextents<int, 2>(int(K), int(TM)));
+#if TB2
+  tA_t tA2(xp + (ulong)TM * K, dextents<int, 2>(int(K), int(TM)));     // the second token block (keep tA's line intact:
+#endif                                                                  // decoder fusions rewrite it textually)
   const uint c0b = 4u * ((lane & 1u) + 2u * ((lane >> 3) & 1u));      // this thread's column-run base
   const uint c1b = ((lane >> 1) & 3u) + 4u * ((lane >> 4) & 1u);      // this thread's row-slot base
   const uint mq = (lane & 1u) | (((lane >> 3) & 1u) << 1);            // its member id in the quad sharing those rows
+#if COOP_A9
+  const uint kr = ((lane >> 1) & 3u) + 4u * ((lane >> 4) & 1u);       // Apple9: its reduction slots kr + 8*jj, its tokens kr + 8*mb
+  const uint nc = 2u * (lane & 1u) + 4u * ((lane >> 3) & 1u);         // Apple9: its rows nc + e + 8*s
+#define LANE_TOKEN kr                                                 // the token row of this lane's destination elements
+#else
+#define LANE_TOKEN c1b
+#endif
 #if POST_NORM
   float norm_r = 0.f;
 #endif
   for (uint tile = p.tile0 + sg_tile; tile < p.tile0 + p.n_tiles; tile += n_tg) {
     auto bT = op.get_right_input_cooperative_tensor<bfloat, bfloat, float>();
+#if STAGE_B
+    auto cT = op.get_destination_cooperative_tensor<tA_t, tB_s, float>();
+#else
     auto cT = op.get_destination_cooperative_tensor<tA_t, decltype(bT), float>();
+#endif
     for (uint16_t i = 0; i < cT.get_capacity(); i++) cT[i] = 0.0f;
+#if TB2
+#if KSPLIT > 1 || POST_NORM
+#error "two token blocks need an unsplit reduction and no post-product norm"
+#endif
+    auto cT2 = op.get_destination_cooperative_tensor<tA_t, decltype(bT), float>();
+    for (uint16_t i = 0; i < cT2.get_capacity(); i++) cT2[i] = 0.0f;
+#endif
 #if SCALE_CACHE
-    uint scc[NS_B][NW][SCALE_WORDS * 4];                                // the scale words of this thread's rows and lanes,
+    uint scc[ROWS_T][NW][SCALE_WORDS * 4];                              // the scale words of this thread's rows and lanes,
 #endif                                                                  // kept across the PAYLOAD_WORDS tiles of a lane group
 #if KSPLIT > 1
     for (uint kt = slice * KT_S; kt < (slice + 1u) * KT_S; kt++) {      // this SIMD-group's K slice (whole lane groups under Q_OUTER)
@@ -300,6 +392,7 @@ kernel void gemm_tile(device const uint4* w [[buffer(0)]], device const float* r
       // [16*mq, 16*mq + 16) of the tile (x_permute orders x' the same way): one contiguous half-word (4-bit formats),
       // a whole word (8-bit) or two words (bf16) per row, loaded by this thread alone — no exchange, no redundancy
       // beyond the other half of a 4-bit word, one block scale per row
+#if !COOP_A9
 #pragma clang loop unroll(full)
       for (uint s = 0; s < NS_B; s++) {
         const uint n = c1b + 8u * s;                                     // row inside the tile
@@ -408,6 +501,114 @@ kernel void gemm_tile(device const uint4* w [[buffer(0)]], device const float* r
 #if EXP_MODE == 2
       }
 #endif
+#else
+#pragma clang loop unroll(full)
+      for (uint rr = 0; rr < 2u * NS_B; rr++) {
+        const uint s = rr >> 1, n = nc + (rr & 1u) + 8u * s;             // row inside the tile (pairs of adjacent rows)
+        // A final TN-row tile can extend beyond the last packed block. Those
+        // outputs are masked below, but their cooperative loads must stay valid.
+        const uint last_block = (p.tile0 * TN + p.n_rows - 1u) / R;
+        const uint b = min(tile * NB + n / R, last_block), r = n % R;
+        device const uint4* wb = w + (ulong)b * BLOCK_WORDS;
+        const uint c0 = CT * kr;                                         // this thread's first tile column
+        const uint lw0 = c0 / WPW, e0 = c0 % WPW;                        // its first word inside the tile and code offset
+        const uint ln0 = q * LPT + lw0;                                  // the lane holding that word
+        uint4 words9[NW];
+#pragma clang loop unroll(full)
+        for (uint i = 0; i < NW; i++) {
+#if EXP_MODE == 5
+          words9[i] = uint4(lane * 2654435761u + kt * 40503u + i, n * 97u + kt, i * 7u + lane, kt);
+#else
+          words9[i] = wb[unit_word(ln0 + i, r, j)];
+#endif
+        }
+#if CT < WPW
+        words9[0] = (e0 != 0u) ? uint4(words9[0].z, words9[0].w, 0u, 0u) : words9[0];   // the half this thread owns
+#endif
+        float wv9[NW * WPW];
+#pragma clang loop unroll(full)
+        for (uint i = 0; i < NW; i++) decode_word(words9[i], wv9 + i * WPW);
+#if SCALE_GROUP > 0
+        float scv[NCH];                                                  // one block scale per 16-column chunk
+#if SCALE_BIAS
+        float bv[NCH];
+#endif
+#pragma clang loop unroll(full)
+        for (uint i = 0; i < NW; i++) {
+#if SCALE_PAYLOAD_ORDER  // the pack's scale run order
+          const uint off = r * 32u * SCALE_RUN + j * 64u + (ln0 + i) * 2u;
+          uint sw = reinterpret_cast<device const ushort*>(wb + SCALE_BASE)[off / 2u];
+#pragma clang loop unroll(full)
+          for (uint ch = 0; ch < ((CT < WPW) ? 1u : (WPW / 16u)); ch++)
+            scv[i * (WPW / 16u) + ch] = decode_scale(&sw, e0 / 16u + ch);
+#else
+#if NARROW_SCALE_RUN
+          uint scw[SCALE_RUN / 4u];
+#pragma clang loop unroll(full)
+          for (uint sc = 0; sc < SCALE_RUN / 4u; sc++)
+            scw[sc] = narrow_scale_word(wb, ln0 + i, r, sc);
+#else
+#if SCALE_CACHE
+          if (j == 0u) {
+#pragma clang loop unroll(full)
+            for (uint sc = 0; sc < SCALE_WORDS; sc++) {
+#if EXP_MODE == 5
+              const uint4 v4 = uint4(0x38383838u + lane, 0x38383838u, 0x38383838u + kt, 0x38383838u);
+#else
+              const uint4 v4 = wb[SCALE_WORD(ln0 + i, r, sc)];
+#endif
+              scc[rr][i][4 * sc] = v4.x; scc[rr][i][4 * sc + 1] = v4.y; scc[rr][i][4 * sc + 2] = v4.z; scc[rr][i][4 * sc + 3] = v4.w;
+            }
+          }
+          thread const uint* scw = scc[rr][i];
+#else
+          uint scw[SCALE_WORDS * 4];
+#pragma clang loop unroll(full)
+          for (uint sc = 0; sc < SCALE_WORDS; sc++) {
+#if EXP_MODE == 5
+            const uint4 v4 = uint4(0x38383838u + lane, 0x38383838u, 0x38383838u + kt, 0x38383838u);
+#else
+            const uint4 v4 = wb[SCALE_WORD(ln0 + i, r, sc)];
+#endif
+            scw[4 * sc] = v4.x; scw[4 * sc + 1] = v4.y; scw[4 * sc + 2] = v4.z; scw[4 * sc + 3] = v4.w;
+          }
+#endif
+#endif
+          const uint ln = ln0 + i;                                       // (LANE_OFF is a function of ln)
+#pragma clang loop unroll(full)
+          for (uint ch = 0; ch < ((CT < WPW) ? 1u : (WPW / 16u)); ch++) {
+            const uint g = (LANE_OFF + j * WPW + e0 + 16u * ch) / SCALE_GROUP;
+            scv[i * (WPW / 16u) + ch] = decode_scale(scw + SCALE_UOFF, SCALE_REG_OFFSET(ln) + g);
+#if SCALE_BIAS
+            bv[i * (WPW / 16u) + ch] = decode_bias(scw + SCALE_UOFF, SCALE_REG_OFFSET(ln) + g);
+#endif
+          }
+#endif  // SCALE_PAYLOAD_ORDER
+        }
+#endif
+#pragma clang loop unroll(full)
+        for (uint cc = 0; cc < CT; cc++) {                               // column cc of the thread = reduction slot kr + 8*cc
+            float v = wv9[cc];
+#if SCALE_GROUP > 0
+            v *= scv[cc / 16u];
+#if SCALE_BIAS
+            v += bv[cc / 16u];
+#endif
+#endif
+#if BF16_STORAGE
+            // Preserve the stored BF16 bits instead of expanding each element
+            // to FP32 and rounding it back for the cooperative matrix operand.
+            const uint e = cc;
+            bT[uint16_t((TN / 4u) * cc + rr)] = as_type<bfloat2>(words9[e / 8u][(e % 8u) / 2u])[e % 2u];
+#else
+            bT[uint16_t((TN / 4u) * cc + rr)] = bfloat(v);
+#endif
+        }
+      }
+#if (EXP_MODE == 2)
+      }
+#endif
+#endif
       // the activation slice of this tile: x' is in pack order (word j major, lane minor), whatever the loop order
       const uint kp = j * (32u / LPT) + q;
 #if EXP_MODE == 6
@@ -415,8 +616,21 @@ kernel void gemm_tile(device const uint4* w [[buffer(0)]], device const float* r
 #else
       auto sA = tA.slice<int(TK), int(TM)>(int(kp * TK), 0);
 #endif
-#if EXP_MODE != 1
+#if SPLIT_K
+      (void)sA;                                                        // the fill ran both halves' products
+#elif STAGE_B
+      if (live) {
+        tB_s sBs(stage_b + (kt & 1u) * TN * TK, dextents<int, 2>(int(TK), int(TN)));
+        op.run(sA, sBs, cT);
+      }
+#elif EXP_MODE != 1
       op.run(sA, bT, cT);
+#if TB2
+      if (T_all > TM) {
+        auto sA2 = tA2.slice<int(TK), int(TM)>(int(kp * TK), 0);
+        op.run(sA2, bT, cT2);
+      }
+#endif
 #else
       if (kt == KT - 1u) op.run(sA, bT, cT);                          // fill-only timing: one run so the fill is not dead
 #endif
@@ -466,7 +680,7 @@ kernel void gemm_tile(device const uint4* w [[buffer(0)]], device const float* r
     float ssq = (s0 + s1) + (s2 + s3);
     ssq += simd_shuffle_xor(ssq, ushort(1));
     ssq += simd_shuffle_xor(ssq, ushort(2));
-    norm_r = simd_shuffle(rsqrt(ssq / float(K) + POST_NORM_EPS), ushort(4u * c1b));
+    norm_r = simd_shuffle(rsqrt(ssq / float(K) + POST_NORM_EPS), ushort(4u * LANE_TOKEN));
 #if POST_NORM_ONCE
     }
 #endif
@@ -474,6 +688,22 @@ kernel void gemm_tile(device const uint4* w [[buffer(0)]], device const float* r
     // epilogue over the destination: element ((blk*(TN/16) + jump)*2 + s2) << 2 | q holds row n = c0b + 16*jump + q
     // and token m = 16*blk + c1b + 8*s2; a lane's 4 rows lie in one pack block, the block's other rows in the lanes
     // differing in bit 0 (and bit 3 when R = 16); rows beyond t_active and the range are not written
+#if TB2
+    for (uint hb = 0; hb < 2u; hb++) {
+      if (hb == 1u) {
+        if (T_all <= TM) break;
+        for (uint16_t i = 0; i < cT.get_capacity(); i++) cT[i] = cT2[i];
+        T_act = T_all - TM; token0 += TM;
+        y += (ulong)TM * output_cols;
+#if EPILOGUE == 1
+        residual += (ulong)TM * output_cols;
+#endif
+#if STAT_OUT
+        stat_out += (ulong)TM * p.n_blocks;
+#endif
+      }
+#endif
+#if !COOP_A9
 #pragma clang loop unroll(full)
     for (uint jump = 0; jump < TN / 16u; jump++) {
       const uint n = c0b + 16u * jump;                                   // this lane's 4 consecutive rows of the tile
@@ -547,6 +777,108 @@ kernel void gemm_tile(device const uint4* w [[buffer(0)]], device const float* r
 #endif
         }
     }
+#else
+    // epilogue over the destination (Apple9): element (TN/4)*mb + 2*s + e holds row n = nc + e + 8*s and token
+    // m = kr + 8*mb; a pack block's rows for one token lie in the four lanes differing in bits 0 and 3, R/4 rows each
+    // (R/8 pairs); rows beyond t_active and the range are not written, and every address stays inside its binding
+    // whether or not the lane writes (see the Apple10 epilogue)
+#pragma clang loop unroll(full)
+    for (uint blk = 0; blk < TN / R; blk++) {
+      const uint bb = (tile - p.tile0) * (TN / R) + blk;                 // the range-relative pack block
+      uint nn[R / 4u], rrow[R / 4u];
+      float rs[R / 4u];
+#pragma clang loop unroll(full)
+      for (uint u = 0; u < R / 4u; u++) {                                // u = 2*(s - blk*R/8) + e
+        nn[u] = nc + (u & 1u) + 8u * (blk * (R / 8u) + u / 2u);
+        const uint row = tile * TN + nn[u];                              // the slab row (weights, row scales)
+        rrow[u] = (tile - p.tile0) * TN + nn[u];                         // the range-relative row (outputs)
+        rs[u] = (rrow[u] < p.n_rows) ? GEMM_ROW_SCALE(min(row, p.tile0 * TN + p.n_rows - 1u)) * p.out_scale : 0.0f;
+      }
+#pragma clang loop unroll(full)
+      for (uint mb = 0; mb < TM / 8u; mb++) {
+        const uint m = kr + 8u * mb;
+        float v[R / 4u];
+#pragma clang loop unroll(full)
+        for (uint u = 0; u < R / 4u; u++) v[u] = cT[uint16_t((TN / 4u) * mb + 2u * blk * (R / 8u) + u)] * rs[u];
+#if POST_NORM
+        for (uint u = 0; u < R / 4u; u++) v[u] *= norm_r;
+#endif
+#if EPILOGUE == 2
+        // silu(gate) * up: a block's gate rows [0, CHUNK) and up rows [CHUNK, R); with R = 16 a lane holds both halves
+        // (its row pairs s and s + 1), with R = 8 the partner rows are in the lane differing in bit 3
+#if R == 16
+#define WR 2u
+        float o[2] = {silu_mul(v[0], v[2]), silu_mul(v[1], v[3])};
+        const bool gate_lane = true;
+#else
+#define WR 2u
+        float o[2];
+#pragma clang loop unroll(full)
+        for (uint u = 0; u < 2u; u++) o[u] = silu_mul(v[u], simd_shuffle_xor(v[u], ushort(8)));
+        const bool gate_lane = (lane & 8u) == 0u;
+#endif
+        const uint n_out = p.n_rows / 2u;
+        const bool writer = gate_lane && m < T_act;
+#else
+#define WR (R / 4u)
+        thread float* o = v;
+        const uint n_out = p.n_rows;
+        const bool writer = m < T_act;
+#endif
+        const uint m_in = min(m, T_act - 1u);
+        float ssq = 0.0f;
+#pragma clang loop unroll(full)
+        for (uint u = 0; u < WR; u++) {
+          if (!writer || rrow[u] >= p.n_rows) continue;
+#if EPILOGUE == 2
+          const uint orow = bb * CHUNK + (nn[u] % R);
+#else
+          const uint orow = rrow[u];
+#endif
+          float vv = o[u];
+#if EPILOGUE == 1
+#if EPILOGUE_ROUND
+          vv = round_bf16(vv);
+#endif
+          vv += as_type<float>(uint(residual[(ulong)m_in * n_out + min(orow, n_out - 1u)]) << 16);
+#endif
+          const float vr = round_bf16(vv);
+          ssq = fma(vr, vr, ssq);
+#if NORM_OUT
+          norm_x[(ulong)(token0 + m) * NORM_K + norm_dest(orow)] =
+              ushort(as_type<uint>(round_bf16(vr * norm_weight[orow])) >> 16);
+#endif
+#if PERM_OUT
+          y[(ulong)m * PERM_K + perm_dest(orow)] = ushort(as_type<uint>(vr) >> 16);   // the consumer tile's x' (its K = n_out)
+#elif OUT_BF16
+          y[(ulong)m * n_out + orow] = ushort(as_type<uint>(vr) >> 16);
+#else
+          y[(ulong)m * n_out + orow] = vv;
+#endif
+        }
+#undef WR
+#if STAT_OUT
+        // the block's sum over its rows: the four lanes differing in bits 0 and 3
+        ssq += simd_shuffle_xor(ssq, ushort(1));
+        ssq += simd_shuffle_xor(ssq, ushort(8));
+        if (m < T_act && (lane & 9u) == 0u && rrow[0] < p.n_rows) stat_out[m * p.n_blocks + bb] = ssq;
+#endif
+      }
+    }
+#endif
+#if TB2
+    }
+    if (T_all > TM) {                                                   // back to the first block for the next tile
+      T_act = min(T_all, uint(TM)); token0 -= TM;
+      y -= (ulong)TM * output_cols;
+#if EPILOGUE == 1
+      residual -= (ulong)TM * output_cols;
+#endif
+#if STAT_OUT
+      stat_out -= (ulong)TM * p.n_blocks;
+#endif
+    }
+#endif
   }
 }
 
@@ -575,11 +907,28 @@ struct XPermParams { uint k; uint t_active; uint tm; uint wpw; uint tk; uint sta
 
 static inline uint perm_source(uint i) {                                  // the original column of slot i
   const uint kt = i / TK, slot = i % TK;
+#if COOP_A9
+  const uint c = kt * TK + (TK / 8u) * (slot % 8u) + slot / 8u;           // Apple9: slot kr + 8*jj <- column (TK/8)*kr + jj
+#else
   const uint mq = ((slot >> 2) & 1u) + 2u * ((slot >> 3) & 1u), jump = slot >> 4, qq = slot & 3u;
   const uint c = kt * TK + (TK / 4u) * mq + 4u * jump + qq;               // the pack-order column
+#endif
   const uint span = 32u * WPW;
   const uint j = c / span, rem = c % span, l = rem / WPW, e = rem % WPW;
   return l * KL + j * WPW + e;
+}
+
+// The x' slot of pack-order column c (x_permute's order), for the kernels that read x' outside a tile: Apple10 keeps
+// four consecutive columns in four consecutive slots; Apple9 puts column (TK/8)*kr + jj at slot kr + 8*jj, so four
+// consecutive columns (of one kr run) are four slots 8 apart.
+static inline uint xperm_slot(uint c) {
+  const uint kt = c / TK, r = c % TK;
+#if COOP_A9
+  return kt * TK + r / (TK / 8u) + 8u * (r % (TK / 8u));
+#else
+  const uint mq = r / (TK / 4u), r2 = r % (TK / 4u);
+  return kt * TK + (r2 & 3u) + ((mq & 1u) << 2) + ((mq >> 1) << 3) + ((r2 >> 2) << 4);
+#endif
 }
 
 #ifndef PERM_GROUPS

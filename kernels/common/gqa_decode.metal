@@ -71,12 +71,38 @@ kernel void gqa_decode(device const ushort* qkvg [[buffer(0)]], device ushort* k
   const uint T = p.t_active, position = p.position, n_new = 0u;
 #endif
   const uint qpos0 = position + n_new;                         // the first query position (DRAFT: after the new context)
+#if EXACT_SUB
+#if STEAL || DRAFT || LM_MODE
+#error "EXACT_SUB: the target's prompt passes only"
+#endif
+  // A prompt pass of T rows reproducing passes of EXACT_SUB rows (it starts on their boundary: the session's exact
+  // chunks are multiples of EXACT_SUB): the rows of each such sub-pass take the chunking that sub-pass would
+  // (pick_chunk of its own context), so every row sums its keys in that pass's order. The blocks of the sub-passes
+  // follow one another; s0 is a block's first token and sub-pass s0 appends keys from qpos0 + s0.
+  uint n_exact = 0u;
+  for (uint s0 = 0u; s0 < T; s0 += EXACT_SUB) n_exact += exact_sub_blocks(qpos0, s0, T, rep, p.kv_heads, p.n_sg, p.n_chunks_max);
+  for (uint bx = sg; bx < n_exact; bx += p.n_sg) {
+    uint b = bx, s0 = 0u;
+    for (uint nb = exact_sub_blocks(qpos0, s0, T, rep, p.kv_heads, p.n_sg, p.n_chunks_max); b >= nb;
+         nb = exact_sub_blocks(qpos0, s0, T, rep, p.kv_heads, p.n_sg, p.n_chunks_max)) {
+      b -= nb;
+      s0 += EXACT_SUB;
+    }
+    const uint s1 = min(s0 + EXACT_SUB, T), cs = qpos0 + s1;
+    const uint chs = pick_chunk(cs, p.kv_heads, rep, p.n_sg, p.n_chunks_max), ncs = (cs + chs - 1u) / chs;
+    const uint nrs = (rep * (s1 - s0) + RBMAX - 1u) / RBMAX;
+    const uint rg = b % nrs, c = (b / nrs) % ncs, j = b / (nrs * ncs);
+    const uint k0 = c * chs, k1 = min(k0 + chs, cs);
+    const uint r0 = rep * s0 + rg * RBMAX;
+    const uint nr = min(RBMAX, rep * s1 - r0);
+#else
   const uint rows = rep * T;
   const uint n_rg = (rows + RBMAX - 1u) / RBMAX;
   const uint ctx = qpos0 + T;                                  // keys: [0, position) cached, [position, qpos0) new, [qpos0, ctx) this step
   const uint ch = pick_chunk(ctx, p.kv_heads, rep, p.n_sg, p.n_chunks_max);   // keys per chunk this step (≤ CH)
   const uint n_chunks = (ctx + ch - 1u) / ch;
   const uint n_blocks = p.kv_heads * n_chunks * n_rg;          // block = (kv head, chunk, row group)
+  const uint s0 = 0u;
 #if STEAL
   StealScan scan = steal_begin();                              // own slice first, then steal (kernels/common/steal.metal, #44)
   for (uint b = steal_next(cursors, n_blocks, p.nominal_sg, sg, lane, scan); b != STEAL_NONE; b = steal_next(cursors, n_blocks, p.nominal_sg, sg, lane, scan)) {
@@ -90,6 +116,7 @@ kernel void gqa_decode(device const ushort* qkvg [[buffer(0)]], device ushort* k
     const uint k0 = c * ch, k1 = min(k0 + ch, ctx);
     const uint r0 = rg * RBMAX;
     const uint nr = min(RBMAX, rows - r0);
+#endif
     // prologue: this row group's queries, normed and RoPE'd, DL dims per lane
     float q[RBMAX][DL];
     for (uint r = 0; r < RBMAX; r++) {
@@ -132,7 +159,7 @@ kernel void gqa_decode(device const ushort* qkvg [[buffer(0)]], device ushort* k
           const uint tk = key - position;
           load_dl(qkvg + tk * p.in_stride + p.k_off + j * D + lane * DL, kf);
           norm_rope(kf, k_norm, cos_t + key * D, sin_t + key * D, p.eps, lane);
-          if (rg == 0) {                                   // append k (normed, RoPE'd) and v to the caches once
+          if (rg == 0 && key >= qpos0 + s0) {              // append k (normed, RoPE'd) and v to the caches once
             store_dl(k_cache + (key * p.kv_heads + j) * D + lane * DL, kf);
             copy_dl(v_cache + (key * p.kv_heads + j) * D + lane * DL, qkvg + tk * p.in_stride + p.v_off + j * D + lane * DL);
           }
@@ -231,8 +258,13 @@ kernel void gqa_merge(device const float* part_o [[buffer(0)]], device const flo
   if (t >= T) return;
   const uint rep = p.heads / p.kv_heads;
   const uint j = h / rep, row = t * rep + (h % rep);
-  const uint ch = pick_chunk(ctx, p.kv_heads, rep, p.n_sg, p.n_chunks_max);
-  const uint n_chunks = (ctx + ch - 1u) / ch;
+#if EXACT_SUB
+  const uint ctx_t = ctx - T + min((t / EXACT_SUB + 1u) * EXACT_SUB, T);   // the context of the row's EXACT_SUB-row pass
+#else
+  const uint ctx_t = ctx;
+#endif
+  const uint ch = pick_chunk(ctx_t, p.kv_heads, rep, p.n_sg, p.n_chunks_max);
+  const uint n_chunks = (ctx_t + ch - 1u) / ch;
   float m_g = -INFINITY;
   for (uint c = 0; c < n_chunks; c++) m_g = max(m_g, part_md[((j * p.n_chunks_max + c) * p.rows_max + row) * 2u]);
   float d_g = 0.0f, o[DL];

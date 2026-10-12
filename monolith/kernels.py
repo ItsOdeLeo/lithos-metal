@@ -24,13 +24,21 @@ PERM_OUT_MSL = """
 #ifndef PERM_OUT
 #define PERM_OUT 0
 #endif
+#ifndef PERM_A9
+#define PERM_A9 0
+#endif
 #if PERM_OUT
 static inline uint perm_dest(uint n) {                       // the inverse of x_permute's perm_source for K = PERM_K
   const uint kl = PERM_K / 32u, span = 32u * PERM_WPW;
   const uint l = n / kl, o = n % kl, j = o / PERM_WPW, e = o % PERM_WPW;
   const uint p = j * span + l * PERM_WPW + e;                // the pack-order column
+#if PERM_A9
+  const uint kt = p / PERM_TK, r = p % PERM_TK;              // Apple9: column (TK/8)*kr + jj -> slot kr + 8*jj
+  const uint slot = r / (PERM_TK / 8u) + 8u * (r % (PERM_TK / 8u));
+#else
   const uint kt = p / PERM_TK, r = p % PERM_TK, mq = r / (PERM_TK / 4u), r2 = r % (PERM_TK / 4u);
   const uint slot = (r2 & 3u) | ((mq & 1u) << 2) | ((mq >> 1) << 3) | ((r2 >> 2) << 4);
+#endif
   return kt * PERM_TK + slot;
 }
 #endif
@@ -40,11 +48,38 @@ static inline uint perm_dest(uint n) {                       // the inverse of x
 NORM_OUT_MSL = PERM_OUT_MSL.replace("PERM_", "NORM_").replace("perm_dest", "norm_dest")
 
 
+def coop_layout() -> str:
+    """The cooperative-tensor register layout gemm_tile fills: ``"apple9"`` on the M3 / M4 GPUs (8 × 8 matrices),
+    ``"apple10"`` on the M5's neural accelerators. The backend being compiled for decides; outside a compilation (the
+    kernel harnesses) the device's GPU family does, and without the Metal module the Apple10 layout is assumed."""
+    from .backends.metal.registry import DEVICES
+    device = DEVICES.get(current_backend().id)
+    if device is not None:
+        return "apple9" if device[1] == "Apple9" else "apple10"
+    return "apple9" if _device_family() == 9 else "apple10"
+
+
+_FAMILY: List[Optional[int]] = []
+
+
+def _device_family() -> Optional[int]:
+    if not _FAMILY:
+        try:
+            from .runtime import _native
+            _FAMILY.append(int(_native.Device().info().apple_family) if _native is not None else None)
+        except Exception:                                    # no Metal device here (the contract tier)
+            _FAMILY.append(None)
+    return _FAMILY[0]
+
+
 def perm_out_macros(k: int, wpw: int, tk: int) -> Dict[str, str]:
     """The producer-side macros of a fused permute: the consumer tile's K, its format's weights per word and its TK."""
     if k % (32 * wpw) or k % tk:
         raise ValueError(f"perm_out: K={k} must be a multiple of {32 * wpw} and of {tk}")
-    return {"PERM_OUT": "1", "PERM_K": f"{k}u", "PERM_WPW": f"{wpw}u", "PERM_TK": f"{tk}u"}
+    macros = {"PERM_OUT": "1", "PERM_K": f"{k}u", "PERM_WPW": f"{wpw}u", "PERM_TK": f"{tk}u"}
+    if coop_layout() == "apple9":
+        macros["PERM_A9"] = "1"
+    return macros
 
 
 def template(name: str) -> str:
@@ -261,6 +296,7 @@ def gemm_macros(info: PackInfo, *, tm: int, out_bf16: bool = False, tn: Optional
     K-split finer than the lane groups (8 or 16 slices at K = 4096) needs the cache off."""
     f = FORMATS.get(info.format)
     wpw = int(f.weights_per_word)
+    a9 = coop_layout() == "apple9"
     if tn is None or tk is None:
         # Small INT4 and BF16 projections benefit from fewer live operand registers (#113).
         if info.format == "nvfp4" and info.k >= 4096 and tm == 8:
@@ -269,6 +305,8 @@ def gemm_macros(info: PackInfo, *, tm: int, out_bf16: bool = False, tn: Optional
                 scale_cache = False
         else:
             tn, tk = (16, 64) if ((info.format == "int4_affine" and info.k <= 3072) or (info.format == "bf16" and info.k <= 4096)) and tm <= 16 else gemm_tile_shape(tm)
+        if a9 and tk // 8 < wpw // 2:                          # Apple9: a thread's TK/8 columns are whole words or a half-word
+            tk = 4 * wpw if 4 * wpw <= 256 else tk
     if info.rows not in (8, 16):
         raise ValueError(f"gemm_tile: R={info.rows} must be 8 or 16 (the epilogues index pack blocks)")
     if info.lanes_per_word > 1:
@@ -285,9 +323,14 @@ def gemm_macros(info: PackInfo, *, tm: int, out_bf16: bool = False, tn: Optional
         raise ValueError(f"gemm_tile: R={info.rows} must divide the {tn}-row tile")
     if tm not in (8, 16, 32):
         raise ValueError(f"gemm_tile: TM must be 8, 16 or 32 (got {tm})")
+    if a9 and tk // 8 < wpw // 2:
+        raise ValueError(f"gemm_tile: on Apple9 a thread's TK/8 = {tk // 8} columns must be at least half a {wpw}-weight word")
+    if a9 and f.scale_group and tk // 8 < 16:
+        raise ValueError(f"gemm_tile: on Apple9 a block-scaled format needs TK/8 >= 16 columns per thread (TK={tk})")
     if ksplit not in (1, 2, 4, 8, 16) or (info.k // tk) % ksplit:
         raise ValueError(f"gemm_tile: KSPLIT={ksplit} must be 1, 2, 4, 8 or 16 and divide the {info.k // tk} K tiles")
-    part_bytes = (ksplit - 1) * 32 * (max(1, tm // 16) * tn // 2) * 4       # the slices' partial tiles (part[KSPLIT-1][32][C_CAP] floats)
+    c_cap = (tm // 8) * (tn // 4) if a9 else max(1, tm // 16) * tn // 2
+    part_bytes = (ksplit - 1) * 32 * c_cap * 4                             # the slices' partial tiles (part[KSPLIT-1][32][C_CAP] floats)
     if part_bytes > THREADGROUP_MEMORY_LIMIT:
         raise ValueError(f"gemm_tile: KSPLIT={ksplit} at TM={tm} needs {part_bytes} bytes of threadgroup memory for the partial tiles "
                          f"(the limit is {THREADGROUP_MEMORY_LIMIT})")
@@ -297,14 +340,17 @@ def gemm_macros(info: PackInfo, *, tm: int, out_bf16: bool = False, tn: Optional
               "EPILOGUE": EPILOGUES[epilogue], "STAT_OUT": "1" if stat_out else "0"}
     if round_before_residual:
         macros["EPILOGUE_ROUND"] = "1"
-    if info.format in ("int4_affine", "bf16"):
+    if a9:
+        macros["COOP_A9"] = "1"
+    elif info.format in ("int4_affine", "bf16"):
         macros["COMPACT_PARTIALS"] = "1"
     lpt = tk // wpw                                            # lanes per tile: LPT * 16 bytes of each row's 128-byte line
     if lpt * 16 >= 64:
         macros["Q_OUTER"] = "1"                                # lane group outer (half a line or more per row piece) …
         if info.scale_bytes and scale_cache is not False:      # … and the scale words of a thread's rows and lanes can stay
-            nw = max(1, (tk // 4) // wpw)                      #     in registers across the lane group's words (≤ 16 uints)
-            if (tn // 8) * nw * int(macros["SCALE_WORDS"]) * 4 <= 16:
+            rows_t, ct = (tn // 4, tk // 8) if a9 else (tn // 8, tk // 4)
+            nw = max(1, ct // wpw)                             #     in registers across the lane group's words (≤ 16 uints)
+            if rows_t * nw * int(macros["SCALE_WORDS"]) * 4 <= 16:
                 if ksplit > 1 and ((info.k // tk) // ksplit) % int(macros["PAYLOAD_WORDS"]):     # the cache is filled at a lane group's first word
                     raise ValueError(f"gemm_tile: KSPLIT={ksplit} must leave whole lane groups per slice ({32 // lpt} groups of {macros['PAYLOAD_WORDS']} words)")
                 macros["SCALE_CACHE"] = "1"
@@ -377,16 +423,20 @@ def x_permute_grid(tm: int, *, groups: int = 1, simdgroups: int = GEMM_PERM_SG) 
     return (tm * simdgroups // groups, 1, 1), (32 * groups, 1, 1)
 
 
-def x_permute_columns(k: int, wpw: int, tk: int = GEMM_TK) -> "np.ndarray":
+def x_permute_columns(k: int, wpw: int, tk: int = GEMM_TK, layout: Optional[str] = None) -> "np.ndarray":
     """``perm`` with ``x'[:, i] = x[:, perm[i]]`` — the reduction order gemm_tile reads (numpy reference): the
-    pack's column order, then the accelerator's slot order inside each tk-column tile (see x_permute)."""
+    pack's column order, then the accelerator's slot order inside each tk-column tile (see x_permute) for the
+    cooperative ``layout`` (default: ``coop_layout()``)."""
     import numpy as np
 
     kl = k // 32
     i = np.arange(k)
     kt, slot = i // tk, i % tk
-    mq, jump, qq = ((slot >> 2) & 1) + 2 * ((slot >> 3) & 1), slot >> 4, slot & 3
-    c = kt * tk + (tk // 4) * mq + 4 * jump + qq
+    if (layout or coop_layout()) == "apple9":
+        c = kt * tk + (tk // 8) * (slot % 8) + slot // 8           # slot kr + 8*jj <- tile column (tk/8)*kr + jj
+    else:
+        mq, jump, qq = ((slot >> 2) & 1) + 2 * ((slot >> 3) & 1), slot >> 4, slot & 3
+        c = kt * tk + (tk // 4) * mq + 4 * jump + qq
     span = 32 * wpw
     j, rem = c // span, c % span
     return (rem // wpw) * kl + j * wpw + rem % wpw
@@ -713,6 +763,15 @@ def sample_params(*, vocab: int, t_active: int, n_sg: int, top_k: int = 0, tempe
         raise ValueError("sample_params: temperature must be positive (use the argmax path for greedy)")
     return struct.pack("<IIIIIfffIIII", vocab, t_active, n_sg, -(-vocab // ARGMAX_SPAN), top_k, temperature, top_p, min_p,
                        seed & 0xFFFFFFFF, (seed >> 32) & 0xFFFFFFFF, step, flags)
+
+
+def resample_params(data: bytes, *, temperature: float, top_k: int = 0, top_p: float = 0.0, seed: int = 0) -> bytes:
+    """A ``SampleParams`` record with other sampling settings: what ``sample_params`` gives for the same vocabulary,
+    rows, SIMD groups, ``min_p`` and ``topp_in_topk``. The sampler reads these at run time, so a compiled sampling
+    program serves every temperature, top-k, top-p and seed."""
+    vocab, t_active, n_sg, _, _, _, _, min_p, _, _, step, flags = struct.unpack("<IIIIIfffIIII", data)
+    return sample_params(vocab=vocab, t_active=t_active, n_sg=n_sg, top_k=top_k, temperature=temperature, top_p=top_p,
+                         min_p=min_p, seed=seed, step=step, topp_in_topk=bool(flags & 8))
 
 
 def sample_workspace(t_max: int, n_sg: int) -> Tuple[int, int, int]:

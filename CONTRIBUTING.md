@@ -26,10 +26,11 @@ python3.12 tools/release/build_macos.py
 
 This creates an archive in `dist/` containing the compiled wheel and serving dependency wheels,
 plus a Homebrew formula with the archive's SHA-256. The
-[macOS release workflow](.github/workflows/release.yml) builds and smoke-tests the bundle.
-Manual runs produce reviewable artifacts; a `vVERSION` tag matching `pyproject.toml` publishes release assets.
-After publishing the release, copy the generated formula into `Formula/lithos-metal.rb` in the
-[Lithos tap](https://github.com/lithos-ai/homebrew-tap) and validate it with `brew install` and `brew test`.
+[macOS release workflow](.github/workflows/release.yml) smoke-tests the bundle. Manual runs build one for review; a
+`vVERSION` tag matching `pyproject.toml` publishes the bundle the [release gate](docs/ci.md#releasing) built and
+measured on the tagged commit, and opens
+the pull request that copies the generated formula into `Formula/lithos-metal.rb` in the
+[Lithos tap](https://github.com/lithos-ai/homebrew-tap), whose CI validates it with `brew install` and `brew test`.
 Regenerate the archive and formula together for each version.
 
 ## Test tiers
@@ -40,6 +41,9 @@ Regenerate the archive and formula together for each version.
 | `tests/kernels`, `tests/runtime` | the Metal module | kernels vs their torch-free oracles; the ICB/ring/pump runtime on toy programs |
 | `tests/layers` | torch, transformers, the small checkpoint | each layer's `forward()` oracle vs the HF module on real weights (cos > 0.999, max-abs ≤ scale/64) |
 | `tests/models` | torch, the small checkpoint (+ the Metal module for `test_gpu_golden`) | the model oracle vs its HF golden: per-layer hidden states (cos > 0.999) and 48 greedy tokens; the same through the compiled step program on the GPU |
+
+CI runs the contract tier on every push and the other tiers on bare-metal Macs when a maintainer comments
+`/mac-test` on the pull request ([CI](docs/ci.md)).
 
 Goldens live in `tests/models/<name>/goldens/` (`<tag>.safetensors` + `<tag>.json`), produced by
 `tools/goldens/hf_golden.py` from the HF model in BF16 with eager attention on the CPU; the JSON records the

@@ -468,10 +468,11 @@ def _accel_plan(ctx: _Ctx, info: PackInfo, op: Op, t_c: int, t_src: int, variant
         # the T variants stay on it. A row range keeps the profile's rule (its tile share is the whole op's).
         norm_in = op.attrs.get("norm")
         parts_in = ctx.stat_parts.get(op.inputs[2].name, 1) if norm_in else 1
-        shader_ms = ctx.tuner.tune_gemv(info, t_c, op.attrs.get("epilogue"), bool(norm_in), stat_parts=parts_in).ms
+        shader = ctx.tuner.tune_gemv(info, t_c, op.attrs.get("epilogue"), bool(norm_in), stat_parts=parts_in)
         # the tile path of a norm-fed input is a permute dispatch (the norm applied on the way) plus the tile; an
         # un-normed input is written permuted by its producer (the attention merge, the silu·mul tile) — no permute
-        tile_ms = ctx.tuner.tune_gemm(info, tm, op.attrs.get("epilogue"), permute=bool(norm_in), norm_fed=bool(norm_in), stat_parts=parts_in).ms
+        tile = ctx.tuner.tune_gemm(info, tm, op.attrs.get("epilogue"), permute=bool(norm_in), norm_fed=bool(norm_in), stat_parts=parts_in)
+        shader_ms, tile_ms = (shader.ms if shader else 0.0), (tile.ms if tile else 0.0)      # a shape without a measured choice keeps the rule
         if shader_ms > 0 and tile_ms > 0 and shader_ms < tile_ms:
             return variants, None
     if t_src == STATIC_ROWS or not ctx.dynamic_t:

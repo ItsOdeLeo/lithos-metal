@@ -1,0 +1,25 @@
+{
+  "prompts": [
+    {"id": "math", "max_tokens": 192,
+     "messages": [{"role": "user", "content": "A train leaves at 9:40 and arrives at 13:05. It stops twice for 7 minutes each. How many minutes is it moving? Show the steps."}]},
+    {"id": "code", "max_tokens": 192,
+     "messages": [{"role": "user", "content": "Write a Python function that merges overlapping intervals in a list of (start, end) pairs, with a docstring and two doctests."}]},
+    {"id": "text", "max_tokens": 192,
+     "messages": [{"role": "user", "content": "Explain in one paragraph why the sky is blue during the day and red at sunset."}]},
+    {"id": "chat", "max_tokens": 128,
+     "messages": [{"role": "system", "content": "You are a concise assistant."},
+                  {"role": "user", "content": "I have eggs, rice, scallions and soy sauce. Suggest a dinner and list the steps."}]},
+    {"id": "long", "max_tokens": 64,
+     "repeat": {"times": 48, "text": "Record {i}: the sensor at station {i} reported a temperature of {i}.5 degrees, a humidity of 4{i} percent and a wind speed of {i} meters per second, all within the expected range for the season. "},
+     "messages": [{"role": "user", "content": "{repeat}\nWhich station reported the highest wind speed? Answer with the record number only."}]}
+  ],
+  "cases": [
+    {"name": "qwen3.8-27b-nvfp4-dspark", "min_memory_gb": 40,
+     "args": ["--model", "nvidia/Qwen3.8-27B-NVFP4", "--revision", "482ca0f3832238542f8f5295dde86b5f22711d80",
+              "--draft", "LithosAI/Qwen3.8-27B-DSpark-NVFP4", "--draft-revision", "b169bc4c8dc805a9e6178fa82f6a7b84b169a457"]},
+    {"name": "qwen3.8-27b-nvfp4-plain", "min_memory_gb": 40,
+     "args": ["--model", "nvidia/Qwen3.8-27B-NVFP4", "--revision", "482ca0f3832238542f8f5295dde86b5f22711d80", "--no-draft"]},
+    {"name": "qwen3-8b-nvfp4-plain", "min_memory_gb": 16,
+     "args": ["--model", "nvidia/Qwen3-8B-NVFP4", "--revision", "ccd10a893cbca613259517c3efe08e151ddf2b8e", "--no-draft"]}
+  ]
+}

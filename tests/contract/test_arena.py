@@ -38,3 +38,13 @@ def test_aliasing_adds_write_after_read_barrier():
     reuse_arenas(p)
     assert p.ops[0].bindings[1][1] == p.ops[2].bindings[1][1]
     assert p.ops[2].barrier_before
+
+
+def test_small_values_do_not_take_a_large_freed_slot():
+    # big1's slot is free when small starts; small lives across big2, which must find big1's slot still unclaimed
+    p = Program({}, {n: BufferSpec(size) for n, size in
+                [('input', 64), ('big1', 1 << 20), ('mid', 64), ('small', 64), ('big2', 1 << 20), ('out', 64)]},
+                [op('input', 'big1'), op('big1', 'mid'), op('mid', 'small'), op('small', 'big2'), op('big2', 'out'),
+                 op('small', 'out')])
+    reuse_arenas(p)
+    assert sum(b.nbytes for n, b in p.buffers.items() if n.startswith('prefill.scratch')) == (1 << 20) + 128

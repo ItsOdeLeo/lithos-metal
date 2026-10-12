@@ -132,17 +132,40 @@ class ChipConfig:
         return config
 
 
+def _kernel_choices_file(path: Path) -> bool:
+    """A configuration's ``kernel_choices`` sidecar sits beside it: a table of choices, not a configuration."""
+    with Path(path).open() as f:
+        doc = json.load(f)
+    return "choices" in doc and "engine" not in doc
+
+
+def kernel_choices(config: ChipConfig) -> Dict[str, Any]:
+    """The measured per-shape kernel choices a configuration ships (``kernel_choices``: a file beside it holding the
+    autotuner's cache entries from that chip; the session compiles with them when it does not tune), or none."""
+    name = config.raw.get("kernel_choices")
+    if not name:
+        return {}
+    from .registry import CONFIG_PATHS
+    path = getattr(config, "source", None) or CONFIG_PATHS.get(config.name)       # beside the file it was loaded from
+    if path is None:
+        return {}
+    with (path.parent / name).open() as f:
+        return dict(json.load(f)["choices"])
+
+
 def load_config(path: str | Path) -> ChipConfig:
     p = Path(path)
     with p.open() as f:
         doc = json.load(f)
-    return ChipConfig.from_dict(doc.get("name", p.stem), doc)
+    config = ChipConfig.from_dict(doc.get("name", p.stem), doc)
+    config.source = p.resolve()                  # not a field: the fingerprint stays the content's; sidecars resolve beside it
+    return config
 
 
 def load_configs(directory: Optional[str | Path] = None) -> Dict[str, ChipConfig]:
     from .registry import CONFIG_PATHS
     paths = sorted(Path(directory).glob("*.json")) if directory is not None else CONFIG_PATHS.values()
-    configs = [load_config(p) for p in paths]
+    configs = [load_config(p) for p in paths if not _kernel_choices_file(p)]
     if len({p.name for p in configs}) != len(configs):
         raise ValueError("duplicate backend configuration name")
     return {p.name: p for p in configs}

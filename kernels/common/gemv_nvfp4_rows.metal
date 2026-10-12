@@ -54,7 +54,13 @@ kernel void gemv_nvfp4_rows(device const uint4* w [[buffer(0)]], device const fl
 #endif
  const uint sg=gid/32u,block=sg/(R/NV_ROWS),r0=(sg%(R/NV_ROWS))*NV_ROWS,row0=p.tile0*TN+block*R+r0;
  // A 512-column step advances whole input tiles; its lane offset is invariant.
+#if COOP_A9
+ // Apple9 x': this lane's 16 columns are 16 slots 8 apart (whole input tiles per step: the offset is invariant)
+ device const bfloat* xs=reinterpret_cast<device const bfloat*>(xp);
+ const uint xs0=xperm_slot(lane*16u);
+#else
  const uint xslot=nvfp4_slot4(lane*16u);
+#endif
  float acc[NV_ROWS]={0};
  device const uint4* wb=w+(ulong)(p.tile0*TN/R+block)*BLOCK_WORDS;
 #pragma clang loop unroll_count(NV_UNROLL)
@@ -63,7 +69,11 @@ kernel void gemv_nvfp4_rows(device const uint4* w [[buffer(0)]], device const fl
   const uint local_g=j*2u+sub;
   float4 x[4];
 #pragma clang loop unroll(full)
+#if COOP_A9
+  for(uint v=0;v<4;v++)x[v]=float4(xs[base+xs0+32u*v],xs[base+xs0+32u*v+8u],xs[base+xs0+32u*v+16u],xs[base+xs0+32u*v+24u]);
+#else
   for(uint v=0;v<4;v++)x[v]=float4(xp[base/4u+xslot+4u*v]);
+#endif
 #pragma clang loop unroll(full)
   for(uint r=0;r<NV_ROWS;r++) {
    const uint rr=r0+r;

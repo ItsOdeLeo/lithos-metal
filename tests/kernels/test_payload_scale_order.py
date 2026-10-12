@@ -48,6 +48,8 @@ def test_payload_order_legacy_gemv(dev, k, tokens, rsplit):
 
 @pytest.mark.parametrize('tm,tn,tk,ksplit', [(8, 64, 64, 1), (16, 32, 128, 2), (32, 16, 256, 4)])
 def test_payload_order_other_matrix_tiles(dev, tm, tn, tk, ksplit):
+    if kernels.coop_layout() == "apple9" and tk // 8 < 16:
+        pytest.skip(f"a tile shape the Apple9 cooperative layout does not take: {tn}x{tk} for a 4-bit format")
     x = f32_to_bf16(np.random.default_rng(91).normal(0, .1, (tm, 4096)).astype(np.float32))
     results = []
     for order in ('lane', 'payload'):

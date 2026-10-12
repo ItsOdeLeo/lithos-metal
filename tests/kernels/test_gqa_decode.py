@@ -83,7 +83,10 @@ class Harness:
             lib = library(kernels.gqa_source(True), kernels.gqa_v2_macros(cfg.d, rmax=cfg.rows_max, rg=cfg.rb))
             self.p_dec, self.p_merge = nt.Pipeline(lib, "gqa_decode_v2"), nt.Pipeline(lib, "gqa_merge_v2")
         else:
-            lib = library(kernels.gqa_source(steal=cfg.steal), kernels.gqa_macros(cfg.d, chunk=cfg.chunk, rb_max=cfg.rb, steal=cfg.steal, steal_hits=cfg.steal))
+            macros = kernels.gqa_macros(cfg.d, chunk=cfg.chunk, rb_max=cfg.rb, steal=cfg.steal, steal_hits=cfg.steal)
+            if getattr(cfg, "exact_sub", 0):
+                macros = dict(macros, EXACT_SUB=f"{cfg.exact_sub}u")
+            lib = library(kernels.gqa_source(steal=cfg.steal), macros)
             self.p_dec, self.p_merge = nt.Pipeline(lib, "gqa_decode"), nt.Pipeline(lib, "gqa_merge")
             if cfg.steal:
                 self.p_reset = nt.Pipeline(lib, "steal_reset")
@@ -461,6 +464,40 @@ def test_steal_variant_is_exactly_once_and_identical(dev):
         kk, vv = steal.caches()
         rk, rv = plain.caches()
         assert np.array_equal(kk, rk) and np.array_equal(vv, rv), name
+
+
+
+def _pick_chunk(ctx, kv, rep, rb, n_sg, n_chunks_max, ch=64):
+    """gqa_common.metal's run-time chunk rule."""
+    while ch > 16 and kv * -(-rep // rb) * -(-ctx // (ch // 2)) <= n_sg and -(-ctx // (ch // 2)) <= n_chunks_max:
+        ch //= 2
+    return ch
+
+
+def test_exact_sub_reproduces_shorter_passes(dev):
+    """EXACT_SUB = S: one pass of T rows equals T / S passes of S rows bit for bit (outputs and appended caches),
+    where the chunk the run-time rule picks differs between the sub-passes' contexts and the whole pass's."""
+    cfg = Cfg(heads=8, kv=2, d=128, rot=64, ctx_max=1024, t_max=256)
+    ecfg = Cfg(heads=8, kv=2, d=128, rot=64, ctx_max=1024, t_max=256)
+    ecfg.exact_sub = 64
+    rng = np.random.default_rng(13)
+    qn, kn = _norms(rng, cfg.d)
+    sub, whole = Harness(dev, cfg, qn, kn), Harness(dev, ecfg, qn, kn)
+    sub.n_sg = whole.n_sg = 48                                         # a small crew: the chunk grows from 32 to 64 keys in range
+    position, t = 600, 256
+    chunks = {_pick_chunk(position + e, cfg.kv, cfg.rep, cfg.rb, 48, cfg.n_chunks_max) for e in range(64, t + 1, 64)}
+    assert chunks == {32, 64}
+    k = rbf(rng.standard_normal((cfg.ctx_max, cfg.kv, cfg.d)) * 0.5)
+    v = rbf(rng.standard_normal((cfg.ctx_max, cfg.kv, cfg.d)))
+    k[position:], v[position:] = 0, 0
+    proj = _random_proj(rng, cfg, t)
+    sub.set_caches(k, v)
+    ref = np.concatenate([sub.step(proj[s0:s0 + 64], position + s0) for s0 in range(0, t, 64)])
+    whole.set_caches(k, v)
+    got = whole.step(proj, position)
+    assert np.array_equal(got, ref)
+    for a, b in zip(whole.caches(), sub.caches()):
+        assert np.array_equal(a, b)
 
 
 # ---- v3: core and merge in one dispatch, a threadgroup per query row (#113) -----------------------------------------------

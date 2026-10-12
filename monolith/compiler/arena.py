@@ -40,7 +40,9 @@ def reuse_arenas(program, *, preserve=(), barriers='minimal'):
     mapping = {}
     before = sum(size for _, _, _, size in intervals)
     for start, end, name, size in sorted(intervals):
-        free = [i for i, s in enumerate(slots) if s['end'] < start]
+        # A slot more than twice the value's size is left for a value of its own size: a small value parked in the
+        # freed slot of an attention layer's partials made each later layer open another slot of that size.
+        free = [i for i, s in enumerate(slots) if s['end'] < start and s['size'] <= 2 * size]
         # Prefer an already large-enough allocation, otherwise grow the closest.
         index = min(free, key=lambda i: (max(0, size-slots[i]['size']), abs(slots[i]['size']-size))) if free else len(slots)
         if index == len(slots):

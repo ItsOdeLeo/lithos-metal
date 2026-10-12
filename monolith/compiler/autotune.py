@@ -41,6 +41,22 @@ def gemv_key(info: PackInfo, t: int, epilogue: Optional[str], norm_fed: bool, st
     return key
 
 
+def gemm_key(info: PackInfo, tm: int, epilogue: Optional[str], *, permute: bool = False, norm_fed: bool = False,
+             stat_parts: int = 1) -> str:
+    key = f"gemm3|{info.format}|{info.n}x{info.k}|R{info.rows}|{info.lane_order}|{info.scale_placement}|TM{tm}|{epilogue or 'plain'}"
+    if info.scale_lane_divisor != 1:
+        key += f"|shared-scales{info.scale_lane_divisor}"
+    if info.scale_order != "lane":
+        key += f"|scale-order-{info.scale_order}"
+    tile = kernels.gemm_macros(info, tm=tm)
+    key += f"|tile{tile['TN']}x{tile['TK']}"
+    if tile.get("COMPACT_PARTIALS") == "1":
+        key += "|compact-partials"
+    if permute:
+        key += "|perm" + (f"|norm|P{int(stat_parts)}" if norm_fed else "")
+    return key
+
+
 def gdn_key(hv: int, hk: int, dk: int, dv: int, conv_width: int, t: int) -> str:
     return f"gdn|{hk}x{hv}|{dk}x{dv}|cw{conv_width}|T{t}"
 
@@ -52,6 +68,33 @@ class Choice:
     fuse_norm: bool = False
     ms: float = 0.0
     default_ms: float = 0.0
+
+
+class KernelChoices:
+    """A chip configuration's measured choices (``kernel_choices``: entries of this tuner's cache written on that chip)
+    looked up by the same keys, without timing anything: a shape they do not list compiles with the defaults, as
+    without a tuner (``None``)."""
+
+    measured = True                      # nothing to time: the prompt passes take their tiles' choices too
+
+    def __init__(self, choices: Dict[str, Dict[str, Any]]) -> None:
+        self.choices = dict(choices)
+
+    def tune_gemv(self, info: PackInfo, t: int, epilogue: Optional[str], norm_fed: bool, *, stat_parts: int = 64, **_: Any) -> Optional[Choice]:
+        c = self.choices.get(gemv_key(info, t, epilogue, norm_fed, stat_parts))
+        return c and Choice(dict(c["macros"]), c["grid_mode"], c.get("fuse_norm", False), c.get("ms", 0.0), c.get("default_ms", 0.0))
+
+    def tune_gemm(self, info: PackInfo, tm: int, epilogue: Optional[str], *, permute: bool = False, norm_fed: bool = False,
+                  stat_parts: int = 1, **_: Any) -> Optional[Choice]:
+        c = self.choices.get(gemm_key(info, tm, epilogue, permute=permute, norm_fed=norm_fed, stat_parts=stat_parts))
+        return c and Choice(dict(c["macros"]), c["grid_mode"], False, c.get("ms", 0.0), c.get("default_ms", 0.0))
+
+    def tune_gdn(self, hv: int, hk: int, dk: int, dv: int, conv_width: int, t: int, **_: Any) -> Optional[Choice]:
+        c = self.choices.get(gdn_key(hv, hk, dk, dv, conv_width, t))
+        return c and Choice(dict(c["macros"]), "crew", False, c.get("ms", 0.0), c.get("default_ms", 0.0))
+
+    def save(self, chip: str) -> None:
+        pass
 
 
 class Autotuner:
@@ -179,17 +222,7 @@ class Autotuner:
         tile (the program's, when the producer does not write the input permuted; ``norm_fed`` = the norm applied on
         the way from ``stat_parts`` partials) — the tile-versus-shader decision must see the whole path, and a permute
         run once before every copy hid it."""
-        key = f"gemm3|{info.format}|{info.n}x{info.k}|R{info.rows}|{info.lane_order}|{info.scale_placement}|TM{tm}|{epilogue or 'plain'}"
-        if info.scale_lane_divisor != 1:
-            key += f"|shared-scales{info.scale_lane_divisor}"
-        if info.scale_order != "lane":
-            key += f"|scale-order-{info.scale_order}"
-        tile = kernels.gemm_macros(info, tm=tm)
-        key += f"|tile{tile['TN']}x{tile['TK']}"
-        if tile.get("COMPACT_PARTIALS") == "1":
-            key += "|compact-partials"
-        if permute:
-            key += "|perm" + (f"|norm|P{int(stat_parts)}" if norm_fed else "")
+        key = gemm_key(info, tm, epilogue, permute=permute, norm_fed=norm_fed, stat_parts=stat_parts)
         if key in self.choices and not force:
             c = self.choices[key]
             return Choice(dict(c["macros"]), c["grid_mode"], False, c.get("ms", 0.0), c.get("default_ms", 0.0))

@@ -5,15 +5,60 @@ on:
     tags: ["v*"]
 permissions:
   contents: read
+# One release at a time, every one of them queued (not just the newest): each checks its baseline against the
+# releases published before it.
+concurrency:
+  group: release
+  queue: max
 jobs:
-  bundle:
-    runs-on: macos-26
+  gate:
+    # A tag publishes only a commit the release gate passed (release-gate.yml, docs/ci.md): at least one
+    # `release-gate (<runner>)` status on it, every one of them a success against the newest release behind the
+    # commit. Manual runs build artifacts only.
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      statuses: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: The release gate passed on this commit against the previous release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/status" --jq '.statuses' > statuses.json
+          python3 - <<'PY'
+          import json, sys
+          from pathlib import Path
+          from tools.ci.release_gate import release_refusal, resolve_baseline
+          statuses = json.load(open("statuses.json"))
+          for s in statuses:
+              if s["context"].startswith("release-gate ("):
+                  print(f"{s['context']}: {s['state']}: {s['description']}")
+          previous = resolve_baseline(Path("."), "auto")
+          refusal = release_refusal(statuses, previous)
+          if refusal:
+              sys.exit(f"{refusal}: run the release-gate workflow on this commit against {previous} before tagging.")
+          PY
+  bundle:
+    needs: gate
+    if: ${{ !cancelled() && (needs.gate.result == 'success' || needs.gate.result == 'skipped') }}
+    runs-on: macos-26
+    permissions:
+      actions: read           # the release gate's run and its bundle
+      contents: read
+      statuses: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Verify tag and build the offline wheel bundle
+      - name: Verify the tag
         run: |
           python - <<'PY'
           import os, tomllib
@@ -21,7 +66,40 @@ jobs:
           if os.environ['GITHUB_REF_TYPE'] == 'tag':
               assert os.environ['GITHUB_REF_NAME'] == 'v' + version
           PY
-          python tools/release/build_macos.py --repository "$GITHUB_REPOSITORY"
+      - name: Build the offline wheel bundle (a manual run, for review)
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        run: python tools/release/build_macos.py --repository "$GITHUB_REPOSITORY"
+      - name: Take the bundle the release gate measured
+        # A tag publishes the bytes release-gate.yml built and gated, not a new build.
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/status" --jq '.statuses' > statuses.json
+          run=$(python - <<'PY'
+          import json, re, sys
+          urls = [s["target_url"] for s in json.load(open("statuses.json")) if s["context"].startswith("release-gate (")]
+          runs = {m[1] for u in urls if (m := re.search(r"/actions/runs/(\d+)", u or ""))}
+          if len(runs) != 1:
+              sys.exit(f"the release-gate statuses come from {len(runs)} runs; gate this commit in one run")
+          print(runs.pop())
+          PY
+          )
+          gh run download "$run" --repo "$GITHUB_REPOSITORY" --name release-bundle --dir dist
+          gh run download "$run" --repo "$GITHUB_REPOSITORY" --pattern 'release-gate-*' --dir gate-results
+          python - <<'PY'
+          import json, sys
+          from pathlib import Path
+          from tools.ci.release_gate import bundle_digest, release_refusal, resolve_baseline, uncovered
+          archive = next(Path("dist").glob("lithos-metal-*-macos-arm64.tar.gz"))
+          results = [json.loads(p.read_text()) for p in Path("gate-results").glob("release-gate-*/result.json")]
+          refusal = release_refusal(json.load(open("statuses.json")), resolve_baseline(Path("."), "auto"),
+                                    bundle_digest(archive))
+          refusal = refusal or uncovered(results, json.load(open("tools/ci/release_cases.json")))
+          if refusal:
+              sys.exit(f"{refusal}: run the release-gate workflow on this commit again.")
+          print(f"publishing {archive.name}, the bundle the release gate measured ({bundle_digest(archive)})")
+          PY
       - name: Validate Homebrew formula requirements
         env:
           HOMEBREW_NO_AUTO_UPDATE: "1"
@@ -50,14 +128,79 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: bundle
     runs-on: ubuntu-latest
+    # Required reviewers on the `release` environment approve the publication.
+    environment: release
     permissions:
       contents: write
+      statuses: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: lithos-metal-macos-arm64
+          path: dist
+      - name: Still the gated bundle against the newest release
+        # Checked again after the reviewer's approval: a release published meanwhile is now the baseline.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/status" --jq '.statuses' > statuses.json
+          python3 - <<'PY'
+          import json, sys
+          from pathlib import Path
+          from tools.ci.release_gate import bundle_digest, release_refusal, resolve_baseline
+          archive = next(Path("dist").glob("lithos-metal-*-macos-arm64.tar.gz"))
+          refusal = release_refusal(json.load(open("statuses.json")), resolve_baseline(Path("."), "auto"),
+                                    bundle_digest(archive))
+          if refusal:
+              sys.exit(f"{refusal}: run the release-gate workflow on this commit again.")
+          PY
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+  tap:
+    # Opens the pull request that moves the Lithos tap to this release; the tap's own CI installs and tests it.
+    # Needs HOMEBREW_TAP_TOKEN (contents and pull requests write on lithos-ai/homebrew-tap only); without it the
+    # tap is updated by hand (CONTRIBUTING.md).
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: publish
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
         with:
           name: lithos-metal-macos-arm64
           path: dist
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: dist/*
-          generate_release_notes: true
+      - name: Open the tap pull request
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::warning::HOMEBREW_TAP_TOKEN is not set: copy dist/lithos-metal.rb into the tap by hand."
+            exit 0
+          fi
+          gh auth setup-git
+          git clone --depth 1 https://github.com/lithos-ai/homebrew-tap tap
+          cd tap
+          git switch -c "lithos-metal-$VERSION"
+          cp ../dist/lithos-metal.rb Formula/lithos-metal.rb
+          if git diff --quiet; then
+            echo "The tap already has lithos-metal $VERSION."
+            exit 0
+          fi
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -am "lithos-metal $VERSION"
+          # A rerun after a failed step replaces the branch's commit and keeps the pull request it already opened.
+          git push --force origin "lithos-metal-$VERSION"
+          state=$(gh pr view --repo lithos-ai/homebrew-tap "lithos-metal-$VERSION" --json state --jq .state 2>/dev/null || true)
+          if [ "$state" = OPEN ]; then
+            echo "The tap pull request for $VERSION is open already."
+          else
+            gh pr create --repo lithos-ai/homebrew-tap --head "lithos-metal-$VERSION" --title "lithos-metal $VERSION" \
+              --body "Formula generated by the lithos-metal release workflow for $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$VERSION."
+          fi

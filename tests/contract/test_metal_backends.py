@@ -10,7 +10,7 @@ import pytest
 from monolith import kernels
 from monolith.backends.metal import (ChipConfig, config_for_device, config_path,
     current_backend, get_backend, load_configs, using_backend)
-from monolith.backends.metal.registry import CONFIG_PATHS
+from monolith.backends.metal.registry import BACKENDS, CONFIG_PATHS
 from monolith.compiler import compile_program, emit_program
 from monolith.core import BlockDomain, DType, Graph, OpClass, T
 from monolith.runtime.program import KernelSpec, OpSpec, Program
@@ -18,9 +18,10 @@ from monolith.runtime.program import KernelSpec, OpSpec, Program
 
 @pytest.mark.parametrize('name,cores,family,backend', [
     ('Apple M2 Max', 30, 8, 'm2_max_30c'),
-    ('Apple M3 Pro', 18, 9, 'm3_pro'), ('Apple M3 Max', 30, 9, 'm3_max_30c'),
+    ('Apple M3 Pro', 18, 9, 'm3_pro'), ('Apple M3 Max', 30, 9, 'm3_max_30c'), ('Apple M3 Ultra', 60, 9, 'm3_ultra_60c'),
     ('Apple M4 Pro', 16, 9, 'm4_pro'),
-    ('Apple M4 Pro', 20, 9, 'm4_pro'), ('Apple M5 Pro', 20, 10, 'm5_pro'),
+    ('Apple M4 Pro', 20, 9, 'm4_pro'), ('Apple M4 Max', 32, 9, 'm4_max'),
+    ('Apple M4 Max', 40, 9, 'm4_max'), ('Apple M5 Pro', 20, 10, 'm5_pro'),
     ('Apple M5 Max', 32, 10, 'm5_max_32c'), ('Apple M5 Max', 40, 10, 'm5_max_40c'),
 ])
 def test_exact_device_selection(name, cores, family, backend):
@@ -64,9 +65,24 @@ def test_m3_max_draft_context_is_capped_and_other_chips_are_not():
     assert get_backend('common').serving_context_limit(drafter=True) is None
 
 
+def test_m3_ultra_60c_is_its_own_device():
+    assert config_for_device(60, 9, 'Apple M3 Ultra').backend == 'm3_ultra_60c'
+    for name, cores, family in (('Apple M3 Ultra', 80, 9), ('Apple M3 Max', 60, 9), ('Apple M3 Ultra', 30, 9)):
+        assert config_for_device(cores, family, name) is None
+    assert get_backend('m3_ultra_60c').serving_context_limit(drafter=True) is None
+    assert get_backend('m3_ultra_60c').serving_prefill_chunk({}) == 512
+    assert get_backend('m4_pro').serving_prefill_chunk({}) is None
+
+
+@pytest.mark.parametrize('backend', sorted(BACKENDS))
+def test_every_backend_takes_the_served_model_in_its_prefill_hook(backend):
+    # serving.setup passes the served model: an override without the argument would fail at startup
+    get_backend(backend).serving_prefill_chunk({}, None)
+
+
 def test_unmeasured_backends_have_no_borrowed_tuning():
     configs = load_configs()
-    for name in ('apple-m2-max-30c', 'apple-m3-max-30c', 'apple-m4-pro-16c', 'apple-m4-pro-20c', 'apple-m5-max-32c'):
+    for name in ('apple-m2-max-30c', 'apple-m3-max-30c', 'apple-m4-pro-16c', 'apple-m4-max-32c', 'apple-m4-max-40c', 'apple-m5-max-32c'):
         config = configs[name]
         assert config.validation == 'unmeasured'
         assert config.accelerator == 'off'
@@ -247,6 +263,9 @@ def test_cache_identity_includes_variant_config_and_selected_source(monkeypatch,
     identity = backend.cache_identity(a)
     (tmp_path / 'advance.metal').write_text('// updated override')
     assert identity != backend.cache_identity(a)
+    from monolith.formats import FORMATS
+    monkeypatch.setattr(FORMATS.get('fp8_e4m3'), 'msl_decode', FORMATS.get('fp8_e4m3').msl_decode + '\n// changed decode')
+    assert identity != backend.cache_identity(a)
 
 
 def test_program_backend_metadata_roundtrips_and_old_programs_load():
@@ -272,3 +291,49 @@ def test_report_accepts_unmeasured_bandwidth():
 def test_invalid_template_path_is_rejected(name):
     with pytest.raises((ValueError, FileNotFoundError)):
         kernels.template(name)
+
+
+def test_kernel_choices_look_up_the_tuners_keys_without_timing():
+    import numpy as np
+    from monolith.bench import pack_spec, random_spec
+    from monolith.compiler.autotune import KernelChoices, gemm_key, gemv_key
+    from monolith.formats import PackLayout
+    _, info, _ = pack_spec(random_spec('fp8_e4m3', 64, 1024, np.random.default_rng(0)), PackLayout(rows=16, lane_order='interleaved16'))
+    shader = {'macros': {'RG': '4', 'RSPLIT': '4u'}, 'grid_mode': 'crew4', 'fuse_norm': True, 'ms': 0.1, 'default_ms': 0.2}
+    tile = {'macros': {}, 'grid_mode': 'ksplit4', 'ms': 0.05, 'default_ms': 0.1}
+    choices = KernelChoices({gemv_key(info, 1, None, True, 640): shader, gemm_key(info, 8, None): tile})
+    c = choices.tune_gemv(info, 1, None, True, stat_parts=640)
+    assert (c.macros, c.grid_mode, c.fuse_norm, c.ms) == ({'RG': '4', 'RSPLIT': '4u'}, 'crew4', True, 0.1)
+    assert choices.tune_gemv(info, 2, None, True, stat_parts=640) is None
+    assert choices.tune_gemm(info, 8, None).grid_mode == 'ksplit4'
+    assert choices.tune_gemm(info, 8, None, permute=True) is None
+    assert choices.tune_gdn(32, 16, 128, 128, 4, 1) is None
+
+
+
+@pytest.mark.parametrize('name', ['apple-m3-ultra-60c', 'apple-m4-pro-20c'])
+def test_shipped_kernel_choices_are_valid_geometries(name, tmp_path):
+    from monolith.backends.metal.config import kernel_choices, load_configs
+    configs = load_configs()
+    choices = kernel_choices(configs[name])
+    assert choices
+    for key, c in choices.items():
+        kind, fields = key.split('|')[0], key.split('|')
+        assert kind in ('gemv', 'gemm3', 'gdn'), key
+        if kind == 'gemv':
+            rows = int(next(f for f in fields if f.startswith('R'))[1:])
+            rg, split = int(c['macros']['RG']), int(c['macros'].get('RSPLIT', '1').rstrip('u'))
+            assert c['grid_mode'] in ('crew', 'crew2', 'crew3', 'crew4', 'block'), key
+            assert split in kernels.gemv_rsplits(rows, rg, 'silu_mul' if 'silu_mul' in fields else None), key
+        elif kind == 'gemm3':
+            assert c['grid_mode'] in ('crew', 'crew2') or kernels.gemm_ksplit(c['grid_mode']) > 1, key
+        assert 0 < c['ms'] <= c['default_ms'], key
+    assert kernel_choices(configs['apple-m5-max-40c']) == {}
+    # choices resolve beside the file a configuration was loaded from, under any name
+    import shutil
+    from monolith.backends.metal.config import load_config
+    shutil.copy(config_path(name), tmp_path / 'custom.json')
+    (tmp_path / configs[name].raw['kernel_choices']).write_text(json.dumps({'choices': {'k': choices[next(iter(choices))]}}))
+    assert list(kernel_choices(load_config(tmp_path / 'custom.json'))) == ['k']
+    # the sidecar beside a configuration is not one
+    assert set(load_configs(config_path(name).parent)) == {n for n, p in CONFIG_PATHS.items() if p.parent == config_path(name).parent}

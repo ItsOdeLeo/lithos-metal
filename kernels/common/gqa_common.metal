@@ -62,6 +62,16 @@ static inline uint pick_chunk(uint ctx, uint kv_heads, uint rep, uint n_sg, uint
   return ch;
 }
 
+#if EXACT_SUB
+// The blocks of the EXACT_SUB-row sub-pass starting at token s0 of a T-row prompt pass (gqa_decode's EXACT_SUB form):
+// its own context, chunking and row groups.
+static inline uint exact_sub_blocks(uint qpos0, uint s0, uint T, uint rep, uint kv_heads, uint n_sg, uint n_chunks_max) {
+  const uint s1 = min(s0 + EXACT_SUB, T), cs = qpos0 + s1;
+  const uint ch = pick_chunk(cs, kv_heads, rep, n_sg, n_chunks_max);
+  return kv_heads * ((cs + ch - 1u) / ch) * ((rep * (s1 - s0) + RBMAX - 1u) / RBMAX);
+}
+#endif
+
 struct GqaParams {
   uint heads; uint kv_heads; uint t_active; uint position;
   uint n_sg; uint q_off; uint gate_off; uint k_off;

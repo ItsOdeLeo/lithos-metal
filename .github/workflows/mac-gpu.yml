@@ -1,0 +1,146 @@
+name: mac-gpu
+run-name: >-
+  mac-gpu ${{ inputs.pr && format('PR #{0} ', inputs.pr) || '' }}${{ inputs.git_ref || github.ref_name }}
+  ${{ inputs.runner }}
+
+# The test tiers on bare-metal Apple silicon Macs (docs/ci.md): the Metal kernels, the runtime, the drafter, the
+# layer and model oracles against their goldens. Hosted macOS is virtualized and cannot run them. A self-hosted Mac
+# executes the code under test, so pull requests reach this lane only through `/mac-test`, which a maintainer
+# comments after reading the change (mac-slash.yml); pushes to main run it on every listed runner.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      git_ref:
+        description: "Commit or branch to test (default: the ref the run is dispatched on)"
+        type: string
+        default: ""
+      runner:
+        description: "Runner label, e.g. m5_max_40c (default: every label in vars.MAC_CI_RUNNERS)"
+        type: string
+        default: ""
+      tiers:
+        description: "Comma-separated tiers"
+        type: string
+        default: "contract,kernels,runtime,spec,layers,models"
+      shader_validation:
+        description: "Run the Metal tiers under shader validation"
+        type: boolean
+        default: false
+      pr:
+        description: "Pull request the run belongs to (set by /mac-test)"
+        type: string
+        default: ""
+
+# One run per pull request (or commit) and runner: a newer /mac-test replaces the older one. Runs for different
+# pull requests queue on the runners instead of cancelling each other.
+concurrency:
+  group: mac-gpu-${{ inputs.pr && format('pr{0}', inputs.pr) || inputs.git_ref || github.ref }}-${{ inputs.runner }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.plan.outputs.sha }}
+      runners: ${{ steps.plan.outputs.runners }}
+      tiers: ${{ steps.plan.outputs.tiers }}
+      context: ${{ steps.plan.outputs.context }}
+    steps:
+      - id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GIT_REF: ${{ inputs.git_ref || github.sha }}
+          RUNNER: ${{ inputs.runner }}
+          RUNNERS: ${{ vars.MAC_CI_RUNNERS }}
+          TIERS: ${{ inputs.tiers || 'contract,kernels,runtime,spec,layers,models' }}
+        run: |
+          set -euo pipefail
+          sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GIT_REF" --jq .sha)
+          # Only the whole tier set reports the status a ruleset may require; a subset reports under its own name.
+          set_of() { tr ',' '\n' <<<"$1" | sed '/^$/d' | sort -u | paste -sd, -; }
+          if [ "$(set_of "$TIERS")" = "$(set_of contract,kernels,runtime,spec,layers,models)" ]; then
+            context=mac-gpu
+          else
+            context="mac-gpu partial"
+          fi
+          if [ -n "$RUNNER" ]; then
+            runners=$(jq -cn --arg r "$RUNNER" '[$r]')
+          else
+            runners=$(printf '%s' "${RUNNERS:-[]}" | jq -c 'if type == "array" then . else error("MAC_CI_RUNNERS must be a JSON list") end')
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "runners=$runners" >> "$GITHUB_OUTPUT"
+          echo "tiers=$TIERS" >> "$GITHUB_OUTPUT"
+          echo "context=$context" >> "$GITHUB_OUTPUT"
+          echo "testing $sha on $runners: $TIERS, reported as $context"
+
+  test:
+    needs: plan
+    if: needs.plan.outputs.runners != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJson(needs.plan.outputs.runners) }}
+    runs-on: [self-hosted, macOS, ARM64, "${{ matrix.runner }}"]
+    # The tiers wait for the machine's GPU lock (LITHOS_CI_GPU_WRAPPER) as well as run.
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+          persist-credentials: false
+      - name: Test tiers
+        env:
+          TIERS: ${{ needs.plan.outputs.tiers }}
+          SHADER_VALIDATION: ${{ inputs.shader_validation && '--shader-validation' || '' }}
+        run: >-
+          "${LITHOS_CI_PYTHON:-python3}" tools/ci/mac_gpu.py
+          --root "${LITHOS_CI_ROOT:?the runner .env must set LITHOS_CI_ROOT}"
+          --tiers "$TIERS" --report-dir "$RUNNER_TEMP/mac-gpu" $SHADER_VALIDATION
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mac-gpu-${{ matrix.runner }}
+          path: ${{ runner.temp }}/mac-gpu
+          if-no-files-found: ignore
+
+  report:
+    needs: [plan, test]
+    # Also after a failed plan or a cancellation, so the pending status a slash command set always ends: a run a
+    # maintainer cancelled reports an error, while one a newer run replaced finds the newer status and leaves it
+    # (tools/ci/ci_status.py checks right before each write).
+    if: ${{ always() && (needs.plan.result != 'success' || needs.plan.outputs.runners != '[]') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read      # when this run started (tools/ci/ci_status.py)
+      contents: read
+      statuses: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          sparse-checkout: tools/ci
+      - uses: actions/download-artifact@v4
+        # A job that failed before writing its result uploads nothing; the next step reports that runner as an error.
+        continue-on-error: true
+        with:
+          pattern: mac-gpu-*
+          path: results
+      - name: Set the commit statuses
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.plan.outputs.sha || inputs.git_ref || github.sha }}
+          RUNNERS: ${{ needs.plan.outputs.runners || (inputs.runner && format('["{0}"]', inputs.runner)) || '[]' }}
+          CONTEXT: ${{ needs.plan.outputs.context || 'mac-gpu' }}
+        run: >-
+          python3 tools/ci/ci_status.py --context "$CONTEXT" --sha "$SHA" --runners "$RUNNERS"
+          --results results --artifact-prefix mac-gpu-
+          --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"

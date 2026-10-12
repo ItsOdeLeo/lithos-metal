@@ -51,6 +51,9 @@ def head(tmp_path_factory):
 
 
 def test_lm_head_recipe_keeps_logits_bytes(head):
+    from monolith import kernels
+    if kernels.coop_layout() != "apple10":
+        pytest.skip("the tile operand recipe repacks for the Apple10 cooperative layout")
     dev, original, output = head
     selected = optimize(original, {'lm_head': RECIPE})[1]
     op = next(o for o in selected.ops if o.meta.get('fusion_region') == 'decoder.lm_head')

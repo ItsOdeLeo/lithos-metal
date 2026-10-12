@@ -5,6 +5,14 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, labeled]
 
+# A new push to a pull request replaces its running checks; pushes to branches each keep their own run.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
 jobs:
   contract:
     name: contract tier (no GPU)
@@ -38,3 +46,45 @@ jobs:
         with:
           fetch-depth: 0
       - run: python tools/ci/extension_check.py --base "origin/${{ github.event.pull_request.base.ref }}"
+  macos:
+    # Hosted macOS is virtualized (a paravirtual GPU), so this job builds and imports the Metal runtime and runs the
+    # contract tier on Darwin; the GPU tiers run on bare-metal Macs (docs/ci.md). An install compiles the module for
+    # the user's own Python, so it is built here for the oldest supported version and the newest ones.
+    name: macOS build, Python ${{ matrix.python }} (hosted, no GPU tiers)
+    runs-on: macos-26
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Build the Metal runtime module
+        run: python -m pip install -e ".[dev]" 'fastapi>=0.115' 'pydantic>=2.9' 'httpx>=0.28' 'jinja2>=3.1'
+      - name: The module imports and finds its kernel sources
+        run: python -c 'from monolith.runtime import is_available; from monolith.resources import kernel_root; assert is_available(); assert (kernel_root()/"common"/"embed.metal").is_file()'
+      - name: The GPU tiers collect
+        run: python -m pytest --collect-only -q tests/kernels tests/runtime
+      - run: python -m pytest tests/contract
+  ci-finish:
+    # The one check branch protection requires. Every job above must be listed in `needs`: a skipped job passes here
+    # (the extension test outside model PRs), anything else that is not a success fails.
+    name: ci-finish
+    if: always()
+    needs: [contract, hygiene, extension, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every job passed or was skipped
+        env:
+          NEEDS: ${{ toJson(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+          needs = json.loads(os.environ["NEEDS"])
+          for name, job in needs.items():
+              print(f"{name}: {job['result']}")
+          sys.exit(0 if all(job["result"] in ("success", "skipped") for job in needs.values()) else 1)
+          PY
